@@ -1,0 +1,280 @@
+#include "aster/physics/PhysicsWorld.h"
+
+#include "aster/core/Log.h"
+#include "aster/core/Profile.h"
+
+#include <Jolt/Jolt.h>
+
+#include <Jolt/Core/Factory.h>
+#include <Jolt/Core/JobSystemThreadPool.h>
+#include <Jolt/Core/TempAllocator.h>
+#include <Jolt/Physics/Body/BodyCreationSettings.h>
+#include <Jolt/Physics/Body/BodyFilter.h>
+#include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/RayCast.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
+#include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
+#include <Jolt/Physics/Collision/Shape/SphereShape.h>
+#include <Jolt/Physics/PhysicsSettings.h>
+#include <Jolt/Physics/PhysicsSystem.h>
+#include <Jolt/RegisterTypes.h>
+
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
+#include <thread>
+#include <vector>
+
+namespace aster::physics {
+namespace {
+
+namespace Layers {
+constexpr JPH::ObjectLayer NonMoving = 0;
+constexpr JPH::ObjectLayer Moving = 1;
+} // namespace Layers
+
+namespace BroadPhaseLayers {
+constexpr JPH::BroadPhaseLayer NonMoving(0);
+constexpr JPH::BroadPhaseLayer Moving(1);
+constexpr JPH::uint Count = 2;
+} // namespace BroadPhaseLayers
+
+class BroadPhaseLayerMap final : public JPH::BroadPhaseLayerInterface {
+public:
+    JPH::uint GetNumBroadPhaseLayers() const override { return BroadPhaseLayers::Count; }
+    JPH::BroadPhaseLayer GetBroadPhaseLayer(JPH::ObjectLayer layer) const override {
+        return layer == Layers::NonMoving ? BroadPhaseLayers::NonMoving : BroadPhaseLayers::Moving;
+    }
+#if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
+    const char* GetBroadPhaseLayerName(JPH::BroadPhaseLayer layer) const override {
+        return layer == BroadPhaseLayers::NonMoving ? "NonMoving" : "Moving";
+    }
+#endif
+};
+
+class ObjectVsBroadPhaseFilter final : public JPH::ObjectVsBroadPhaseLayerFilter {
+public:
+    bool ShouldCollide(JPH::ObjectLayer layer, JPH::BroadPhaseLayer bpLayer) const override {
+        return layer == Layers::Moving || bpLayer == BroadPhaseLayers::Moving;
+    }
+};
+
+class ObjectPairFilter final : public JPH::ObjectLayerPairFilter {
+public:
+    bool ShouldCollide(JPH::ObjectLayer a, JPH::ObjectLayer b) const override {
+        return a == Layers::Moving || b == Layers::Moving;
+    }
+};
+
+void traceToLog(const char* fmt, ...) {
+    char text[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+    ASTER_INFO("[Jolt] %s", text);
+}
+
+int g_joltUsers = 0;
+
+void acquireJolt() {
+    if (g_joltUsers++ > 0) return;
+    JPH::RegisterDefaultAllocator();
+    JPH::Trace = traceToLog;
+    JPH::Factory::sInstance = new JPH::Factory();
+    JPH::RegisterTypes();
+}
+
+void releaseJolt() {
+    if (--g_joltUsers > 0) return;
+    JPH::UnregisterTypes();
+    delete JPH::Factory::sInstance;
+    JPH::Factory::sInstance = nullptr;
+}
+
+JPH::Vec3 toJ(Vec3 v) { return JPH::Vec3(v.x, v.y, v.z); }
+JPH::RVec3 toJR(Vec3 v) { return JPH::RVec3(v.x, v.y, v.z); }
+JPH::Quat toJ(Quat q) { return JPH::Quat(q.x, q.y, q.z, q.w).Normalized(); }
+Vec3 fromJ(JPH::Vec3Arg v) { return {v.GetX(), v.GetY(), v.GetZ()}; }
+Quat fromJ(JPH::QuatArg q) { return {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}; }
+#ifdef JPH_DOUBLE_PRECISION
+Vec3 fromJ(JPH::RVec3Arg v) { return {static_cast<f32>(v.GetX()), static_cast<f32>(v.GetY()), static_cast<f32>(v.GetZ())}; }
+#endif
+
+} // namespace
+
+struct PhysicsWorld::Impl {
+    BroadPhaseLayerMap broadPhaseLayers;
+    ObjectVsBroadPhaseFilter objectVsBroadPhase;
+    ObjectPairFilter objectPairs;
+    JPH::PhysicsSystem system;
+    JPH::TempAllocatorImpl tempAllocator{16 * 1024 * 1024};
+    JPH::JobSystemThreadPool* jobs = nullptr;
+    std::vector<JPH::BodyID> bodies; // 생성 순서 (해시용)
+    u32 threads = 0;
+
+    JPH::BodyInterface& bi() { return system.GetBodyInterfaceNoLock(); }
+    const JPH::BodyInterface& bi() const { return system.GetBodyInterfaceNoLock(); }
+
+    BodyId add(const JPH::Shape* shape, const BodyDesc& d) {
+        const JPH::EMotionType motion = d.motion == Motion::Static    ? JPH::EMotionType::Static
+                                        : d.motion == Motion::Dynamic ? JPH::EMotionType::Dynamic
+                                                                      : JPH::EMotionType::Kinematic;
+        JPH::BodyCreationSettings s(shape, toJR(d.position), toJ(d.rotation), motion,
+                                    d.motion == Motion::Static ? Layers::NonMoving : Layers::Moving);
+        s.mFriction = d.friction;
+        s.mRestitution = d.restitution;
+        s.mLinearDamping = d.linearDamping;
+        s.mAngularDamping = d.angularDamping;
+        s.mAllowSleeping = d.allowSleep;
+        if (d.lockRotation)
+            s.mAllowedDOFs = JPH::EAllowedDOFs::TranslationX | JPH::EAllowedDOFs::TranslationY | JPH::EAllowedDOFs::TranslationZ;
+        if (d.mass > 0.0f && d.motion == Motion::Dynamic) {
+            s.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
+            s.mMassPropertiesOverride.mMass = d.mass;
+        }
+        const JPH::BodyID id = bi().CreateAndAddBody(
+            s, d.motion == Motion::Static ? JPH::EActivation::DontActivate : JPH::EActivation::Activate);
+        if (id.IsInvalid()) {
+            ASTER_ERROR("Physics: body limit reached");
+            return kInvalidBody;
+        }
+        bodies.push_back(id);
+        return id.GetIndexAndSequenceNumber();
+    }
+};
+
+PhysicsWorld::~PhysicsWorld() { shutdown(); }
+
+bool PhysicsWorld::init(u32 maxBodies, u32 threads) {
+    shutdown();
+    acquireJolt();
+    m = new Impl();
+    if (threads == 0) {
+        const u32 cores = std::max(1u, std::thread::hardware_concurrency());
+        threads = std::clamp(cores - 1, 1u, 6u); // 메인 스레드 하나는 남긴다
+    }
+    m->threads = threads;
+    m->jobs = new JPH::JobSystemThreadPool(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, static_cast<int>(threads));
+    m->system.Init(maxBodies, 0, 65536, 20480, m->broadPhaseLayers, m->objectVsBroadPhase, m->objectPairs);
+    m->bodies.reserve(maxBodies);
+    return true;
+}
+
+void PhysicsWorld::shutdown() {
+    if (!m) return;
+    JPH::BodyInterface& bi = m->bi();
+    for (const JPH::BodyID& id : m->bodies) {
+        bi.RemoveBody(id);
+        bi.DestroyBody(id);
+    }
+    delete m->jobs;
+    delete m;
+    m = nullptr;
+    releaseJolt();
+}
+
+void PhysicsWorld::setGravity(Vec3 gravity) { m->system.SetGravity(toJ(gravity)); }
+
+BodyId PhysicsWorld::createBox(Vec3 half, const BodyDesc& desc) {
+    half = {std::max(half.x, 0.01f), std::max(half.y, 0.01f), std::max(half.z, 0.01f)};
+    const f32 convexRadius = std::min(JPH::cDefaultConvexRadius, std::min({half.x, half.y, half.z}) * 0.5f);
+    JPH::Ref<JPH::Shape> shape = new JPH::BoxShape(toJ(half), convexRadius);
+    return m->add(shape, desc);
+}
+
+BodyId PhysicsWorld::createSphere(f32 radius, const BodyDesc& desc) {
+    JPH::Ref<JPH::Shape> shape = new JPH::SphereShape(std::max(radius, 0.01f));
+    return m->add(shape, desc);
+}
+
+BodyId PhysicsWorld::createCapsule(f32 halfHeight, f32 radius, const BodyDesc& desc) {
+    JPH::Ref<JPH::Shape> shape = new JPH::CapsuleShape(std::max(halfHeight, 0.01f), std::max(radius, 0.01f));
+    return m->add(shape, desc);
+}
+
+BodyId PhysicsWorld::createConvexHull(const Vec3* points, u32 count, const BodyDesc& desc) {
+    JPH::Array<JPH::Vec3> pts;
+    pts.reserve(count);
+    for (u32 i = 0; i < count; ++i) pts.push_back(toJ(points[i]));
+    JPH::ConvexHullShapeSettings settings(pts);
+    JPH::ShapeSettings::ShapeResult result = settings.Create();
+    if (result.HasError()) {
+        Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+        for (u32 i = 0; i < count; ++i) {
+            lo = {std::min(lo.x, points[i].x), std::min(lo.y, points[i].y), std::min(lo.z, points[i].z)};
+            hi = {std::max(hi.x, points[i].x), std::max(hi.y, points[i].y), std::max(hi.z, points[i].z)};
+        }
+        ASTER_WARN("Physics: convex hull failed (%s), using bounding box", result.GetError().c_str());
+        BodyDesc shifted = desc;
+        shifted.position = desc.position + rotate(desc.rotation, (lo + hi) * 0.5f);
+        return createBox((hi - lo) * 0.5f, shifted);
+    }
+    return m->add(result.Get(), desc);
+}
+
+void PhysicsWorld::destroy(BodyId body) {
+    const JPH::BodyID id(body);
+    auto it = std::find(m->bodies.begin(), m->bodies.end(), id);
+    if (it == m->bodies.end()) return;
+    m->bi().RemoveBody(id);
+    m->bi().DestroyBody(id);
+    m->bodies.erase(it);
+}
+
+void PhysicsWorld::optimize() { m->system.OptimizeBroadPhase(); }
+
+void PhysicsWorld::step(f32 dt, int collisionSteps) {
+    ASTER_ZONE("Physics step");
+    m->system.Update(dt, collisionSteps, &m->tempAllocator, m->jobs);
+}
+
+Vec3 PhysicsWorld::position(BodyId body) const { return fromJ(m->bi().GetPosition(JPH::BodyID(body))); }
+Quat PhysicsWorld::rotation(BodyId body) const { return fromJ(m->bi().GetRotation(JPH::BodyID(body))); }
+Vec3 PhysicsWorld::linearVelocity(BodyId body) const { return fromJ(m->bi().GetLinearVelocity(JPH::BodyID(body))); }
+Vec3 PhysicsWorld::angularVelocity(BodyId body) const { return fromJ(m->bi().GetAngularVelocity(JPH::BodyID(body))); }
+
+void PhysicsWorld::setLinearVelocity(BodyId body, Vec3 v) { m->bi().SetLinearVelocity(JPH::BodyID(body), toJ(v)); }
+void PhysicsWorld::setAngularVelocity(BodyId body, Vec3 v) { m->bi().SetAngularVelocity(JPH::BodyID(body), toJ(v)); }
+
+void PhysicsWorld::addLinearVelocity(BodyId body, Vec3 delta) {
+    const JPH::BodyID id(body);
+    m->bi().SetLinearVelocity(id, m->bi().GetLinearVelocity(id) + toJ(delta)); // 잠든 바디도 깨운다
+}
+
+void PhysicsWorld::setTransform(BodyId body, Vec3 position, Quat rotation) {
+    m->bi().SetPositionAndRotation(JPH::BodyID(body), toJR(position), toJ(rotation), JPH::EActivation::Activate);
+}
+
+bool PhysicsWorld::isActive(BodyId body) const { return m->bi().IsActive(JPH::BodyID(body)); }
+
+bool PhysicsWorld::castRay(Vec3 origin, Vec3 direction, RayHit& hit, BodyId ignore) const {
+    const JPH::RRayCast ray{toJR(origin), toJ(direction)};
+    JPH::RayCastResult result;
+    const JPH::IgnoreSingleBodyFilter filter(JPH::BodyID(ignore == kInvalidBody ? JPH::BodyID::cInvalidBodyID : ignore));
+    if (!m->system.GetNarrowPhaseQueryNoLock().CastRay(ray, result, {}, {}, filter)) return false;
+    hit.body = result.mBodyID.GetIndexAndSequenceNumber();
+    hit.fraction = result.mFraction;
+    return true;
+}
+
+void PhysicsWorld::hashState(Hasher& hasher) const {
+    const JPH::BodyInterface& bi = m->bi();
+    for (const JPH::BodyID& id : m->bodies) {
+        const Vec3 p = fromJ(bi.GetPosition(id));
+        const Quat q = fromJ(bi.GetRotation(id));
+        const Vec3 v = fromJ(bi.GetLinearVelocity(id));
+        const Vec3 w = fromJ(bi.GetAngularVelocity(id));
+        hasher.add(p);
+        hasher.add(q);
+        hasher.add(v);
+        hasher.add(w);
+    }
+}
+
+u32 PhysicsWorld::bodyCount() const { return static_cast<u32>(m->bodies.size()); }
+u32 PhysicsWorld::activeBodyCount() const { return m->system.GetNumActiveBodies(JPH::EBodyType::RigidBody); }
+u32 PhysicsWorld::threadCount() const { return m->threads; }
+
+} // namespace aster::physics
