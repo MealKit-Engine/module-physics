@@ -32,6 +32,25 @@ struct RayHit {
     f32 fraction = 1.0f; // 0..1, 광선 길이에 대한 비율
 };
 
+// 물리 상태 전체의 스냅샷 (바디 목록·모양·속도·접촉 캐시). 같은 프로세스 안에서만 쓴다 (되감기, 그림자 시뮬레이션).
+class PhysicsSnapshot {
+public:
+    PhysicsSnapshot();
+    ~PhysicsSnapshot();
+    PhysicsSnapshot(PhysicsSnapshot&& other) noexcept;
+    PhysicsSnapshot& operator=(PhysicsSnapshot&& other) noexcept;
+    PhysicsSnapshot(const PhysicsSnapshot&) = delete;
+    PhysicsSnapshot& operator=(const PhysicsSnapshot&) = delete;
+
+    bool empty() const;
+    size_t byteSize() const; // 대략적인 메모리 사용량
+
+private:
+    friend class PhysicsWorld;
+    struct Impl;
+    Impl* m = nullptr;
+};
+
 class PhysicsWorld {
 public:
     PhysicsWorld() = default;
@@ -71,6 +90,11 @@ public:
 
     // 모든 바디 상태를 생성 순서대로 해시에 넣는다 (디싱크 감지용).
     void hashState(Hasher& hasher) const;
+
+    // 스냅샷 저장·복원. 복원하면 그 사이에 만들거나 지운 바디도 되돌린다 (바디 id까지 같게).
+    // 바디 id는 엔진이 정하는 순서로 매기므로(지운 번호를 정해진 순서로 다시 씀) 복원 뒤에 만드는 바디의 id도 원래와 같다.
+    void save(PhysicsSnapshot& out) const;
+    bool restore(const PhysicsSnapshot& snapshot);
     u32 bodyCount() const;
     u32 activeBodyCount() const;
     u32 threadCount() const;

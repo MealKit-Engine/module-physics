@@ -18,9 +18,11 @@
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/PhysicsSettings.h>
 #include <Jolt/Physics/PhysicsSystem.h>
+#include <Jolt/Physics/StateRecorder.h>
 #include <Jolt/RegisterTypes.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cstdarg>
 #include <cstdio>
 #include <thread>
@@ -76,6 +78,32 @@ void traceToLog(const char* fmt, ...) {
     MEALKIT_INFO("[Jolt] %s", text);
 }
 
+// Jolt 상태를 바이트 배열에 쓰고 읽는다
+class ByteStateRecorder final : public JPH::StateRecorder {
+public:
+    explicit ByteStateRecorder(std::vector<u8>& data) : m_data(data) {}
+    void WriteBytes(const void* data, size_t size) override {
+        const u8* p = static_cast<const u8*>(data);
+        m_data.insert(m_data.end(), p, p + size);
+    }
+    void ReadBytes(void* out, size_t size) override {
+        if (m_pos + size > m_data.size()) {
+            m_failed = true;
+            std::memset(out, 0, size);
+            return;
+        }
+        std::memcpy(out, m_data.data() + m_pos, size);
+        m_pos += size;
+    }
+    bool IsEOF() const override { return m_pos >= m_data.size(); }
+    bool IsFailed() const override { return m_failed; }
+
+private:
+    std::vector<u8>& m_data;
+    size_t m_pos = 0;
+    bool m_failed = false;
+};
+
 int g_joltUsers = 0;
 
 void acquireJolt() {
@@ -102,6 +130,67 @@ Quat fromJ(JPH::QuatArg q) { return {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}; }
 Vec3 fromJ(JPH::RVec3Arg v) { return {static_cast<f32>(v.GetX()), static_cast<f32>(v.GetY()), static_cast<f32>(v.GetZ())}; }
 #endif
 
+// 만든 바디의 기록: 스냅샷을 되돌릴 때 사라진 바디를 같은 id로 다시 만든다
+struct BodyRecord {
+    JPH::BodyID id;
+    JPH::RefConst<JPH::Shape> shape;
+    BodyDesc desc;
+};
+
+// 바디 id 할당 상태 (스냅샷에 들어간다)
+struct BodyIdAllocator {
+    std::vector<u32> free; // 다시 쓸 번호 (맨 뒤부터)
+    std::vector<u8> sequence;
+    u32 next = 0;
+};
+
+JPH::BodyCreationSettings makeSettings(const JPH::Shape* shape, const BodyDesc& d) {
+    const JPH::EMotionType motion = d.motion == Motion::Static    ? JPH::EMotionType::Static
+                                    : d.motion == Motion::Dynamic ? JPH::EMotionType::Dynamic
+                                                                  : JPH::EMotionType::Kinematic;
+    JPH::BodyCreationSettings s(shape, toJR(d.position), toJ(d.rotation), motion,
+                                d.motion == Motion::Static ? Layers::NonMoving : Layers::Moving);
+    s.mFriction = d.friction;
+    s.mRestitution = d.restitution;
+    s.mLinearDamping = d.linearDamping;
+    s.mAngularDamping = d.angularDamping;
+    s.mAllowSleeping = d.allowSleep;
+    if (d.lockRotation)
+        s.mAllowedDOFs = JPH::EAllowedDOFs::TranslationX | JPH::EAllowedDOFs::TranslationY | JPH::EAllowedDOFs::TranslationZ;
+    if (d.mass > 0.0f && d.motion == Motion::Dynamic) {
+        s.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
+        s.mMassPropertiesOverride.mMass = d.mass;
+    }
+    return s;
+}
+
+} // namespace
+
+struct PhysicsSnapshot::Impl {
+    std::vector<BodyRecord> records;
+    BodyIdAllocator ids;
+    std::vector<u8> jolt;
+};
+
+PhysicsSnapshot::PhysicsSnapshot() = default;
+PhysicsSnapshot::~PhysicsSnapshot() { delete m; }
+PhysicsSnapshot::PhysicsSnapshot(PhysicsSnapshot&& other) noexcept : m(other.m) { other.m = nullptr; }
+PhysicsSnapshot& PhysicsSnapshot::operator=(PhysicsSnapshot&& other) noexcept {
+    std::swap(m, other.m);
+    return *this;
+}
+bool PhysicsSnapshot::empty() const { return !m; }
+size_t PhysicsSnapshot::byteSize() const {
+    return m ? m->jolt.size() + m->records.size() * sizeof(BodyRecord) + m->ids.sequence.size() + m->ids.free.size() * 4 : 0;
+}
+
+namespace {
+
+void addBody(JPH::BodyInterface& bi, const BodyRecord& r) {
+    bi.CreateBodyWithID(r.id, makeSettings(r.shape, r.desc));
+    bi.AddBody(r.id, r.desc.motion == Motion::Static ? JPH::EActivation::DontActivate : JPH::EActivation::Activate);
+}
+
 } // namespace
 
 struct PhysicsWorld::Impl {
@@ -111,37 +200,33 @@ struct PhysicsWorld::Impl {
     JPH::PhysicsSystem system;
     JPH::TempAllocatorImpl tempAllocator{16 * 1024 * 1024};
     JPH::JobSystemThreadPool* jobs = nullptr;
-    std::vector<JPH::BodyID> bodies; // 생성 순서 (해시용)
+    std::vector<BodyRecord> bodies; // 생성 순서 (해시, 스냅샷)
+    BodyIdAllocator ids;
     u32 threads = 0;
 
     JPH::BodyInterface& bi() { return system.GetBodyInterfaceNoLock(); }
     const JPH::BodyInterface& bi() const { return system.GetBodyInterfaceNoLock(); }
 
     BodyId add(const JPH::Shape* shape, const BodyDesc& d) {
-        const JPH::EMotionType motion = d.motion == Motion::Static    ? JPH::EMotionType::Static
-                                        : d.motion == Motion::Dynamic ? JPH::EMotionType::Dynamic
-                                                                      : JPH::EMotionType::Kinematic;
-        JPH::BodyCreationSettings s(shape, toJR(d.position), toJ(d.rotation), motion,
-                                    d.motion == Motion::Static ? Layers::NonMoving : Layers::Moving);
-        s.mFriction = d.friction;
-        s.mRestitution = d.restitution;
-        s.mLinearDamping = d.linearDamping;
-        s.mAngularDamping = d.angularDamping;
-        s.mAllowSleeping = d.allowSleep;
-        if (d.lockRotation)
-            s.mAllowedDOFs = JPH::EAllowedDOFs::TranslationX | JPH::EAllowedDOFs::TranslationY | JPH::EAllowedDOFs::TranslationZ;
-        if (d.mass > 0.0f && d.motion == Motion::Dynamic) {
-            s.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
-            s.mMassPropertiesOverride.mMass = d.mass;
-        }
-        const JPH::BodyID id = bi().CreateAndAddBody(
-            s, d.motion == Motion::Static ? JPH::EActivation::DontActivate : JPH::EActivation::Activate);
-        if (id.IsInvalid()) {
+        u32 index = 0;
+        if (!ids.free.empty()) {
+            index = ids.free.back();
+            ids.free.pop_back();
+        } else if (ids.next < ids.sequence.size()) {
+            index = ids.next++;
+        } else {
             MEALKIT_ERROR("Physics: body limit reached");
             return kInvalidBody;
         }
-        bodies.push_back(id);
-        return id.GetIndexAndSequenceNumber();
+        BodyRecord record{JPH::BodyID(index, ids.sequence[index]), shape, d};
+        addBody(bi(), record);
+        bodies.push_back(record);
+        return record.id.GetIndexAndSequenceNumber();
+    }
+
+    void remove(const JPH::BodyID& id) {
+        bi().RemoveBody(id);
+        bi().DestroyBody(id);
     }
 };
 
@@ -159,16 +244,14 @@ bool PhysicsWorld::init(u32 maxBodies, u32 threads) {
     m->jobs = new JPH::JobSystemThreadPool(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, static_cast<int>(threads));
     m->system.Init(maxBodies, 0, 65536, 20480, m->broadPhaseLayers, m->objectVsBroadPhase, m->objectPairs);
     m->bodies.reserve(maxBodies);
+    m->ids.sequence.assign(maxBodies, 0);
+    m->ids.free.reserve(maxBodies);
     return true;
 }
 
 void PhysicsWorld::shutdown() {
     if (!m) return;
-    JPH::BodyInterface& bi = m->bi();
-    for (const JPH::BodyID& id : m->bodies) {
-        bi.RemoveBody(id);
-        bi.DestroyBody(id);
-    }
+    for (const BodyRecord& r : m->bodies) m->remove(r.id);
     delete m->jobs;
     delete m;
     m = nullptr;
@@ -216,11 +299,13 @@ BodyId PhysicsWorld::createConvexHull(const Vec3* points, u32 count, const BodyD
 
 void PhysicsWorld::destroy(BodyId body) {
     const JPH::BodyID id(body);
-    auto it = std::find(m->bodies.begin(), m->bodies.end(), id);
+    auto it = std::find_if(m->bodies.begin(), m->bodies.end(), [&](const BodyRecord& r) { return r.id == id; });
     if (it == m->bodies.end()) return;
-    m->bi().RemoveBody(id);
-    m->bi().DestroyBody(id);
+    m->remove(id);
     m->bodies.erase(it);
+    const u32 index = id.GetIndex();
+    ++m->ids.sequence[index]; // 같은 번호를 다시 쓰면 다른 id가 되게
+    m->ids.free.push_back(index);
 }
 
 void PhysicsWorld::optimize() { m->system.OptimizeBroadPhase(); }
@@ -261,7 +346,9 @@ bool PhysicsWorld::castRay(Vec3 origin, Vec3 direction, RayHit& hit, BodyId igno
 
 void PhysicsWorld::hashState(Hasher& hasher) const {
     const JPH::BodyInterface& bi = m->bi();
-    for (const JPH::BodyID& id : m->bodies) {
+    for (const BodyRecord& r : m->bodies) {
+        const JPH::BodyID id = r.id;
+        hasher.add(id.GetIndexAndSequenceNumber());
         const Vec3 p = fromJ(bi.GetPosition(id));
         const Quat q = fromJ(bi.GetRotation(id));
         const Vec3 v = fromJ(bi.GetLinearVelocity(id));
@@ -271,6 +358,37 @@ void PhysicsWorld::hashState(Hasher& hasher) const {
         hasher.add(v);
         hasher.add(w);
     }
+}
+
+void PhysicsWorld::save(PhysicsSnapshot& out) const {
+    if (!out.m) out.m = new PhysicsSnapshot::Impl();
+    out.m->records = m->bodies;
+    out.m->ids = m->ids;
+    out.m->jolt.clear();
+    ByteStateRecorder recorder(out.m->jolt);
+    m->system.SaveState(recorder, JPH::EStateRecorderState::All);
+}
+
+bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
+    if (!snapshot.m) return false;
+    const PhysicsSnapshot::Impl& s = *snapshot.m;
+    auto contains = [](const std::vector<BodyRecord>& list, const JPH::BodyID& id) {
+        return std::any_of(list.begin(), list.end(), [&](const BodyRecord& r) { return r.id == id; });
+    };
+    // 스냅샷 뒤에 만든 바디는 지우고, 스냅샷 뒤에 지운 바디는 같은 id로 다시 만든다
+    for (const BodyRecord& r : m->bodies)
+        if (!contains(s.records, r.id)) m->remove(r.id);
+    for (const BodyRecord& r : s.records)
+        if (!contains(m->bodies, r.id)) addBody(m->bi(), r);
+    m->bodies = s.records;
+    m->ids = s.ids;
+    std::vector<u8> bytes = s.jolt; // StateRecorder는 읽기 위치를 가진다
+    ByteStateRecorder recorder(bytes);
+    if (!m->system.RestoreState(recorder)) {
+        MEALKIT_ERROR("Physics: RestoreState failed");
+        return false;
+    }
+    return true;
 }
 
 u32 PhysicsWorld::bodyCount() const { return static_cast<u32>(m->bodies.size()); }
