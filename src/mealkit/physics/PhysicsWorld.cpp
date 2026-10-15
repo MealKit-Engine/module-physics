@@ -127,7 +127,9 @@ JPH::Quat toJ(Quat q) { return JPH::Quat(q.x, q.y, q.z, q.w).Normalized(); }
 Vec3 fromJ(JPH::Vec3Arg v) { return {v.GetX(), v.GetY(), v.GetZ()}; }
 Quat fromJ(JPH::QuatArg q) { return {q.GetX(), q.GetY(), q.GetZ(), q.GetW()}; }
 #ifdef JPH_DOUBLE_PRECISION
-Vec3 fromJ(JPH::RVec3Arg v) { return {static_cast<f32>(v.GetX()), static_cast<f32>(v.GetY()), static_cast<f32>(v.GetZ())}; }
+Vec3 fromJ(JPH::RVec3Arg v) {
+    return {static_cast<f32>(v.GetX()), static_cast<f32>(v.GetY()), static_cast<f32>(v.GetZ())};
+}
 #endif
 
 // 만든 바디의 기록: 스냅샷을 되돌릴 때 사라진 바디를 같은 id로 다시 만든다
@@ -156,7 +158,8 @@ JPH::BodyCreationSettings makeSettings(const JPH::Shape* shape, const BodyDesc& 
     s.mAngularDamping = d.angularDamping;
     s.mAllowSleeping = d.allowSleep;
     if (d.lockRotation)
-        s.mAllowedDOFs = JPH::EAllowedDOFs::TranslationX | JPH::EAllowedDOFs::TranslationY | JPH::EAllowedDOFs::TranslationZ;
+        s.mAllowedDOFs =
+            JPH::EAllowedDOFs::TranslationX | JPH::EAllowedDOFs::TranslationY | JPH::EAllowedDOFs::TranslationZ;
     if (d.mass > 0.0f && d.motion == Motion::Dynamic) {
         s.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
         s.mMassPropertiesOverride.mMass = d.mass;
@@ -181,7 +184,8 @@ PhysicsSnapshot& PhysicsSnapshot::operator=(PhysicsSnapshot&& other) noexcept {
 }
 bool PhysicsSnapshot::empty() const { return !m; }
 size_t PhysicsSnapshot::byteSize() const {
-    return m ? m->jolt.size() + m->records.size() * sizeof(BodyRecord) + m->ids.sequence.size() + m->ids.free.size() * 4 : 0;
+    return m ? m->jolt.size() + m->records.size() * sizeof(BodyRecord) + m->ids.sequence.size() + m->ids.free.size() * 4
+             : 0;
 }
 
 namespace {
@@ -337,7 +341,8 @@ bool PhysicsWorld::isActive(BodyId body) const { return m->bi().IsActive(JPH::Bo
 bool PhysicsWorld::castRay(Vec3 origin, Vec3 direction, RayHit& hit, BodyId ignore) const {
     const JPH::RRayCast ray{toJR(origin), toJ(direction)};
     JPH::RayCastResult result;
-    const JPH::IgnoreSingleBodyFilter filter(JPH::BodyID(ignore == kInvalidBody ? JPH::BodyID::cInvalidBodyID : ignore));
+    const JPH::IgnoreSingleBodyFilter filter(
+        JPH::BodyID(ignore == kInvalidBody ? JPH::BodyID::cInvalidBodyID : ignore));
     if (!m->system.GetNarrowPhaseQueryNoLock().CastRay(ray, result, {}, {}, filter)) return false;
     hit.body = result.mBodyID.GetIndexAndSequenceNumber();
     hit.fraction = result.mFraction;
