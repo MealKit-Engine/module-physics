@@ -1,7 +1,7 @@
-#include "aster/physics/PhysicsWorld.h"
+#include "mealkit/physics/PhysicsWorld.h"
 
-#include "aster/core/Log.h"
-#include "aster/core/Profile.h"
+#include "mealkit/core/Log.h"
+#include "mealkit/core/Profile.h"
 
 #include <Jolt/Jolt.h>
 
@@ -26,7 +26,7 @@
 #include <thread>
 #include <vector>
 
-namespace aster::physics {
+namespace mealkit::physics {
 namespace {
 
 namespace Layers {
@@ -73,7 +73,7 @@ void traceToLog(const char* fmt, ...) {
     va_start(args, fmt);
     vsnprintf(text, sizeof(text), fmt, args);
     va_end(args);
-    ASTER_INFO("[Jolt] %s", text);
+    MEALKIT_INFO("[Jolt] %s", text);
 }
 
 int g_joltUsers = 0;
@@ -137,7 +137,7 @@ struct PhysicsWorld::Impl {
         const JPH::BodyID id = bi().CreateAndAddBody(
             s, d.motion == Motion::Static ? JPH::EActivation::DontActivate : JPH::EActivation::Activate);
         if (id.IsInvalid()) {
-            ASTER_ERROR("Physics: body limit reached");
+            MEALKIT_ERROR("Physics: body limit reached");
             return kInvalidBody;
         }
         bodies.push_back(id);
@@ -206,7 +206,7 @@ BodyId PhysicsWorld::createConvexHull(const Vec3* points, u32 count, const BodyD
             lo = {std::min(lo.x, points[i].x), std::min(lo.y, points[i].y), std::min(lo.z, points[i].z)};
             hi = {std::max(hi.x, points[i].x), std::max(hi.y, points[i].y), std::max(hi.z, points[i].z)};
         }
-        ASTER_WARN("Physics: convex hull failed (%s), using bounding box", result.GetError().c_str());
+        MEALKIT_WARN("Physics: convex hull failed (%s), using bounding box", result.GetError().c_str());
         BodyDesc shifted = desc;
         shifted.position = desc.position + rotate(desc.rotation, (lo + hi) * 0.5f);
         return createBox((hi - lo) * 0.5f, shifted);
@@ -226,7 +226,7 @@ void PhysicsWorld::destroy(BodyId body) {
 void PhysicsWorld::optimize() { m->system.OptimizeBroadPhase(); }
 
 void PhysicsWorld::step(f32 dt, int collisionSteps) {
-    ASTER_ZONE("Physics step");
+    MEALKIT_ZONE("Physics step");
     m->system.Update(dt, collisionSteps, &m->tempAllocator, m->jobs);
 }
 
@@ -277,4 +277,4 @@ u32 PhysicsWorld::bodyCount() const { return static_cast<u32>(m->bodies.size());
 u32 PhysicsWorld::activeBodyCount() const { return m->system.GetNumActiveBodies(JPH::EBodyType::RigidBody); }
 u32 PhysicsWorld::threadCount() const { return m->threads; }
 
-} // namespace aster::physics
+} // namespace mealkit::physics

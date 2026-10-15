@@ -1,13 +1,13 @@
 #pragma once
 
-#include "aster/core/Hash.h"
-#include "aster/core/Math.h"
+#include "mealkit/core/Hash.h"
+#include "mealkit/core/Math.h"
 
 // Jolt Physics 래퍼. 게임 코드에 Jolt 헤더가 퍼지지 않게 핸들(BodyId) 기반 API만 노출한다.
 //
 // 결정론: Jolt는 CROSS_PLATFORM_DETERMINISTIC으로 빌드되어, 같은 호출을 같은 순서로 하면
 // CPU나 스레드 수와 관계없이 같은 결과를 낸다. 따라서 바디 생성/삭제/힘 적용 순서를 모든 피어에서 같게 유지한다.
-namespace aster::physics {
+namespace mealkit::physics {
 
 using BodyId = u32;
 inline constexpr BodyId kInvalidBody = 0xFFFFFFFFu;
@@ -80,4 +80,4 @@ private:
     Impl* m = nullptr;
 };
 
-} // namespace aster::physics
+} // namespace mealkit::physics
