@@ -3,6 +3,8 @@
 #include "mealkit/core/Hash.h"
 #include "mealkit/core/Math.h"
 
+#include <vector>
+
 // Jolt Physics 래퍼. 게임 코드에 Jolt 헤더가 퍼지지 않게 핸들(BodyId) 기반 API만 노출한다.
 //
 // 결정론: Jolt는 CROSS_PLATFORM_DETERMINISTIC으로 빌드되어, 같은 호출을 같은 순서로 하면
@@ -30,6 +32,14 @@ struct BodyDesc {
 struct RayHit {
     BodyId body = kInvalidBody;
     f32 fraction = 1.0f; // 0..1, 광선 길이에 대한 비율
+};
+
+// 새로 닿은 바디 쌍 (소리·효과용). 상태가 아니라 화면 알림 재료다: 해시·스냅샷에 들어가지 않는다.
+struct ContactEvent {
+    BodyId a = kInvalidBody; // a < b
+    BodyId b = kInvalidBody;
+    Vec3 point;      // 접촉점 (월드)
+    f32 speed = 0.0f; // 닿는 순간 법선 방향으로 다가오던 속도 (m/s)
 };
 
 // 물리 상태 전체의 스냅샷 (바디 목록·모양·속도·접촉 캐시). 같은 프로세스 안에서만 쓴다 (되감기, 그림자 시뮬레이션).
@@ -74,6 +84,11 @@ public:
     void optimize();
 
     void step(f32 dt, int collisionSteps = 1);
+
+    // 접촉 이벤트: minSpeed(m/s) 이상으로 새로 닿은 쌍을 step()마다 모은다. 0이면 끈다(기본, 비용 없음).
+    // 물리 작업 스레드가 모으고 step() 끝에서 세기 큰 순(같으면 바디 번호 순)으로 정렬해 maxPerStep개만 남긴다 → 스레드 수와 무관하게 같다.
+    void setContactEvents(f32 minSpeed, u32 maxPerStep);
+    const std::vector<ContactEvent>& contacts() const; // 마지막 step()의 것
 
     Vec3 position(BodyId body) const;
     Quat rotation(BodyId body) const;

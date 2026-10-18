@@ -11,6 +11,7 @@
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyFilter.h>
 #include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
@@ -25,6 +26,7 @@
 #include <cstring>
 #include <cstdarg>
 #include <cstdio>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -197,7 +199,31 @@ void addBody(JPH::BodyInterface& bi, const BodyRecord& r) {
 
 } // namespace
 
+// 접촉 이벤트 모으기 (Jolt 작업 스레드에서 불린다)
+class ContactCollector final : public JPH::ContactListener {
+public:
+    f32 minSpeed = 0.0f;
+    std::mutex mutex;
+    std::vector<ContactEvent> events;
+
+    void OnContactAdded(const JPH::Body& body1, const JPH::Body& body2, const JPH::ContactManifold& manifold,
+                        JPH::ContactSettings&) override {
+        if (minSpeed <= 0.0f || manifold.mRelativeContactPointsOn1.empty()) return;
+        const JPH::RVec3 point = manifold.GetWorldSpaceContactPointOn1(0);
+        const JPH::Vec3 relative = body1.GetPointVelocity(point) - body2.GetPointVelocity(point);
+        const f32 speed = relative.Dot(manifold.mWorldSpaceNormal); // 법선은 1 → 2
+        if (speed < minSpeed) return;
+        BodyId a = body1.GetID().GetIndexAndSequenceNumber(), b = body2.GetID().GetIndexAndSequenceNumber();
+        if (b < a) std::swap(a, b);
+        ContactEvent e{a, b, fromJ(point), speed};
+        std::lock_guard<std::mutex> lock(mutex);
+        events.push_back(e);
+    }
+};
+
 struct PhysicsWorld::Impl {
+    ContactCollector contacts;
+    u32 maxContacts = 0;
     BroadPhaseLayerMap broadPhaseLayers;
     ObjectVsBroadPhaseFilter objectVsBroadPhase;
     ObjectPairFilter objectPairs;
@@ -316,8 +342,29 @@ void PhysicsWorld::optimize() { m->system.OptimizeBroadPhase(); }
 
 void PhysicsWorld::step(f32 dt, int collisionSteps) {
     MEALKIT_ZONE("Physics step");
+    std::vector<ContactEvent>& events = m->contacts.events;
+    events.clear();
     m->system.Update(dt, collisionSteps, &m->tempAllocator, m->jobs);
+    if (events.empty()) return;
+    // 모은 순서는 스레드마다 다르다: 세기 → 바디 번호 → 위치로 정렬해 같은 결과를 만든다
+    std::sort(events.begin(), events.end(), [](const ContactEvent& x, const ContactEvent& y) {
+        if (x.speed != y.speed) return x.speed > y.speed;
+        if (x.a != y.a) return x.a < y.a;
+        if (x.b != y.b) return x.b < y.b;
+        if (x.point.x != y.point.x) return x.point.x < y.point.x;
+        if (x.point.y != y.point.y) return x.point.y < y.point.y;
+        return x.point.z < y.point.z;
+    });
+    if (events.size() > m->maxContacts) events.resize(m->maxContacts);
 }
+
+void PhysicsWorld::setContactEvents(f32 minSpeed, u32 maxPerStep) {
+    m->contacts.minSpeed = minSpeed;
+    m->maxContacts = maxPerStep;
+    m->system.SetContactListener(minSpeed > 0.0f ? &m->contacts : nullptr);
+}
+
+const std::vector<ContactEvent>& PhysicsWorld::contacts() const { return m->contacts.events; }
 
 Vec3 PhysicsWorld::position(BodyId body) const { return fromJ(m->bi().GetPosition(JPH::BodyID(body))); }
 Quat PhysicsWorld::rotation(BodyId body) const { return fromJ(m->bi().GetRotation(JPH::BodyID(body))); }
