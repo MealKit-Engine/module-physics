@@ -3,6 +3,7 @@
 #include "mealkit/core/Hash.h"
 #include "mealkit/core/Math.h"
 
+#include <string>
 #include <vector>
 
 // Jolt Physics 래퍼. 게임 코드에 Jolt 헤더가 퍼지지 않게 핸들(BodyId) 기반 API만 노출한다.
@@ -105,6 +106,11 @@ public:
 
     // 모든 바디 상태를 생성 순서대로 해시에 넣는다 (디싱크 감지용).
     void hashState(Hasher& hasher) const;
+    // 해시에 넣는 값을 바디마다 한 줄로 (디싱크 덤프, game/DesyncDump.h): "body <순번> <id> p x y z q x y z w v x y z w x y z".
+    // 실수는 %.9g (float를 정확히 되읽는다)
+    void writeState(std::string& out) const;
+    // 시험용: 처음 만든 움직이는 바디의 속도를 아주 조금 바꾼다 (--desync-test, 일부러 디싱크를 낸다)
+    void nudgeForTest();
 
     // 스냅샷 저장·복원. 복원하면 그 사이에 만들거나 지운 바디도 되돌린다 (바디 id까지 같게).
     // 바디 id는 엔진이 정하는 순서로 매기므로(지운 번호를 정해진 순서로 다시 씀) 복원 뒤에 만드는 바디의 id도 원래와 같다.

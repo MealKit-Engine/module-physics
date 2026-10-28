@@ -412,6 +412,30 @@ void PhysicsWorld::hashState(Hasher& hasher) const {
     }
 }
 
+void PhysicsWorld::writeState(std::string& out) const {
+    const JPH::BodyInterface& bi = m->bi();
+    char line[320];
+    u32 index = 0;
+    for (const BodyRecord& r : m->bodies) {
+        const Vec3 p = fromJ(bi.GetPosition(r.id));
+        const Quat q = fromJ(bi.GetRotation(r.id));
+        const Vec3 v = fromJ(bi.GetLinearVelocity(r.id));
+        const Vec3 w = fromJ(bi.GetAngularVelocity(r.id));
+        std::snprintf(line, sizeof(line),
+                      "body %u %08x p %.9g %.9g %.9g q %.9g %.9g %.9g %.9g v %.9g %.9g %.9g w %.9g %.9g %.9g\n", index++,
+                      r.id.GetIndexAndSequenceNumber(), p.x, p.y, p.z, q.x, q.y, q.z, q.w, v.x, v.y, v.z, w.x, w.y, w.z);
+        out += line;
+    }
+}
+
+void PhysicsWorld::nudgeForTest() {
+    for (const BodyRecord& r : m->bodies)
+        if (r.desc.motion == Motion::Dynamic) {
+            m->bi().SetLinearVelocity(r.id, m->bi().GetLinearVelocity(r.id) + JPH::Vec3(0.001f, 0.0f, 0.0f));
+            return;
+        }
+}
+
 void PhysicsWorld::save(PhysicsSnapshot& out) const {
     if (!out.m) out.m = new PhysicsSnapshot::Impl();
     out.m->records = m->bodies;
