@@ -55,6 +55,9 @@ public:
 
     bool empty() const;
     size_t byteSize() const; // 대략적인 메모리 사용량
+    // 다른 프로세스로 보낼 바이트 (바디 모양 포함, 같은 빌드끼리): 중간 참가·재접속 (game/WorldSnapshot.h)
+    void write(std::vector<u8>& out) const;
+    bool read(const u8* data, size_t size);
 
 private:
     friend class PhysicsWorld;
@@ -116,6 +119,8 @@ public:
     // 바디 id는 엔진이 정하는 순서로 매기므로(지운 번호를 정해진 순서로 다시 씀) 복원 뒤에 만드는 바디의 id도 원래와 같다.
     void save(PhysicsSnapshot& out) const;
     bool restore(const PhysicsSnapshot& snapshot);
+    // 바디를 모두 지우고 id 할당을 처음으로 (다른 프로세스의 스냅샷을 복원하기 전: 같은 id에 다른 모양의 바디가 있을 수 있다)
+    void clearBodies();
     u32 bodyCount() const;
     u32 activeBodyCount() const;
     u32 threadCount() const;

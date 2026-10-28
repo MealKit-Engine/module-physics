@@ -185,6 +185,84 @@ PhysicsSnapshot& PhysicsSnapshot::operator=(PhysicsSnapshot&& other) noexcept {
     return *this;
 }
 bool PhysicsSnapshot::empty() const { return !m; }
+
+namespace {
+
+template <class T>
+void writeValue(JPH::StreamOut& out, const T& v) {
+    out.WriteBytes(&v, sizeof(T));
+}
+template <class T>
+void writeVector(JPH::StreamOut& out, const std::vector<T>& v) {
+    writeValue(out, static_cast<u32>(v.size()));
+    if (!v.empty()) out.WriteBytes(v.data(), v.size() * sizeof(T));
+}
+template <class T>
+bool readVector(JPH::StreamIn& in, std::vector<T>& v, u32 limit) {
+    u32 n = 0;
+    in.ReadBytes(&n, sizeof(n));
+    if (in.IsFailed() || n > limit) return false;
+    v.resize(n);
+    if (n) in.ReadBytes(v.data(), n * sizeof(T));
+    return !in.IsFailed();
+}
+
+} // namespace
+
+// 바디마다 (id, BodyDesc, 모양). 모양은 Jolt 이진 형식이고 같은 모양은 한 번만 쓴다 (SaveWithChildren의 id 표)
+void PhysicsSnapshot::write(std::vector<u8>& out) const {
+    out.clear();
+    if (!m) return;
+    ByteStateRecorder stream(out);
+    JPH::Shape::ShapeToIDMap shapeIds;
+    JPH::Shape::MaterialToIDMap materialIds;
+    writeValue(stream, static_cast<u32>(m->records.size()));
+    for (const BodyRecord& r : m->records) {
+        writeValue(stream, r.id.GetIndexAndSequenceNumber());
+        writeValue(stream, r.desc);
+        r.shape->SaveWithChildren(stream, shapeIds, materialIds);
+    }
+    writeValue(stream, m->ids.next);
+    writeVector(stream, m->ids.free);
+    writeVector(stream, m->ids.sequence);
+    writeVector(stream, m->jolt);
+}
+
+bool PhysicsSnapshot::read(const u8* data, size_t size) {
+    std::vector<u8> bytes(data, data + size);
+    ByteStateRecorder stream(bytes);
+    Impl loaded;
+    JPH::Shape::IDToShapeMap shapes;
+    JPH::Shape::IDToMaterialMap materials;
+    constexpr u32 kLimit = 1u << 24;
+    u32 count = 0;
+    stream.ReadBytes(&count, sizeof(count));
+    if (stream.IsFailed() || count > kLimit) return false;
+    loaded.records.reserve(count);
+    for (u32 i = 0; i < count; ++i) {
+        u32 id = 0;
+        BodyRecord r;
+        stream.ReadBytes(&id, sizeof(id));
+        stream.ReadBytes(&r.desc, sizeof(r.desc));
+        if (stream.IsFailed()) return false;
+        JPH::Shape::ShapeResult shape = JPH::Shape::sRestoreWithChildren(stream, shapes, materials);
+        if (shape.HasError() || stream.IsFailed()) {
+            MEALKIT_ERROR("Physics snapshot: body shape %u could not be read (%s)", i,
+                          shape.HasError() ? shape.GetError().c_str() : "truncated");
+            return false;
+        }
+        r.id = JPH::BodyID(id);
+        r.shape = shape.Get();
+        loaded.records.push_back(std::move(r));
+    }
+    stream.ReadBytes(&loaded.ids.next, sizeof(loaded.ids.next));
+    if (!readVector(stream, loaded.ids.free, kLimit) || !readVector(stream, loaded.ids.sequence, kLimit) ||
+        !readVector(stream, loaded.jolt, 1u << 30))
+        return false;
+    if (!m) m = new Impl();
+    *m = std::move(loaded);
+    return true;
+}
 size_t PhysicsSnapshot::byteSize() const {
     return m ? m->jolt.size() + m->records.size() * sizeof(BodyRecord) + m->ids.sequence.size() + m->ids.free.size() * 4
              : 0;
@@ -465,6 +543,14 @@ bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
         return false;
     }
     return true;
+}
+
+void PhysicsWorld::clearBodies() {
+    for (const BodyRecord& r : m->bodies) m->remove(r.id);
+    m->bodies.clear();
+    const size_t maxBodies = m->ids.sequence.size();
+    m->ids = {};
+    m->ids.sequence.assign(maxBodies, 0);
 }
 
 u32 PhysicsWorld::bodyCount() const { return static_cast<u32>(m->bodies.size()); }
