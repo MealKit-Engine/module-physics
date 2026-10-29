@@ -6,10 +6,10 @@
 #include <string>
 #include <vector>
 
-// Jolt Physics 래퍼. 게임 코드에 Jolt 헤더가 퍼지지 않게 핸들(BodyId) 기반 API만 노출한다.
+// Jolt Physics wrapper. Exposes only a handle-based (BodyId) API so Jolt headers don't spread into game code.
 //
-// 결정론: Jolt는 CROSS_PLATFORM_DETERMINISTIC으로 빌드되어, 같은 호출을 같은 순서로 하면
-// CPU나 스레드 수와 관계없이 같은 결과를 낸다. 따라서 바디 생성/삭제/힘 적용 순서를 모든 피어에서 같게 유지한다.
+// Determinism: Jolt is built with CROSS_PLATFORM_DETERMINISTIC, so the same calls in the same order
+// give the same results regardless of CPU or thread count. So body create/delete/force application order is kept identical on all peers.
 namespace mealkit::physics {
 
 using BodyId = u32;
@@ -25,25 +25,25 @@ struct BodyDesc {
     f32 restitution = 0.1f;
     f32 linearDamping = 0.05f;
     f32 angularDamping = 0.05f;
-    f32 mass = 0.0f;           // 0 = 모양과 밀도(1000 kg/m³)로 계산
-    bool lockRotation = false; // 캐릭터용: 넘어지지 않게 회전을 막는다
+    f32 mass = 0.0f;           // 0 = computed from shape and density (1000 kg/m³)
+    bool lockRotation = false; // for characters: prevents rotation so they don't fall over
     bool allowSleep = true;
 };
 
 struct RayHit {
     BodyId body = kInvalidBody;
-    f32 fraction = 1.0f; // 0..1, 광선 길이에 대한 비율
+    f32 fraction = 1.0f; // 0..1, fraction of the ray length
 };
 
-// 새로 닿은 바디 쌍 (소리·효과용). 상태가 아니라 화면 알림 재료다: 해시·스냅샷에 들어가지 않는다.
+// Newly touching body pairs (for sound/effects). Not state but material for view notifications: not in the hash/snapshots.
 struct ContactEvent {
     BodyId a = kInvalidBody; // a < b
     BodyId b = kInvalidBody;
-    Vec3 point;      // 접촉점 (월드)
-    f32 speed = 0.0f; // 닿는 순간 법선 방향으로 다가오던 속도 (m/s)
+    Vec3 point;      // contact point (world)
+    f32 speed = 0.0f; // approach speed along the normal at the moment of contact (m/s)
 };
 
-// 물리 상태 전체의 스냅샷 (바디 목록·모양·속도·접촉 캐시). 같은 프로세스 안에서만 쓴다 (되감기, 그림자 시뮬레이션).
+// Snapshot of the whole physics state (body list, shapes, velocities, contact cache). Used only within the same process (rewind, shadow simulation).
 class PhysicsSnapshot {
 public:
     PhysicsSnapshot();
@@ -54,8 +54,8 @@ public:
     PhysicsSnapshot& operator=(const PhysicsSnapshot&) = delete;
 
     bool empty() const;
-    size_t byteSize() const; // 대략적인 메모리 사용량
-    // 다른 프로세스로 보낼 바이트 (바디 모양 포함, 같은 빌드끼리): 중간 참가·재접속 (game/WorldSnapshot.h)
+    size_t byteSize() const; // rough memory usage
+    // Bytes to send to another process (including body shapes, between identical builds): late join/reconnect (game/WorldSnapshot.h)
     void write(std::vector<u8>& out) const;
     bool read(const u8* data, size_t size);
 
@@ -72,7 +72,7 @@ public:
     PhysicsWorld(const PhysicsWorld&) = delete;
     PhysicsWorld& operator=(const PhysicsWorld&) = delete;
 
-    // threads = 0 이면 코어 수에 맞춘다. 스레드 수는 결정론에 영향을 주지 않는다.
+    // threads = 0 matches the core count. The thread count doesn't affect determinism.
     bool init(u32 maxBodies = 16384, u32 threads = 0);
     void shutdown();
     bool initialized() const { return m != nullptr; }
@@ -80,19 +80,19 @@ public:
     void setGravity(Vec3 gravity);
     BodyId createBox(Vec3 halfExtents, const BodyDesc& desc);
     BodyId createSphere(f32 radius, const BodyDesc& desc);
-    BodyId createCapsule(f32 halfHeight, f32 radius, const BodyDesc& desc); // halfHeight = 원기둥 부분의 절반
-    // 볼록 껍질. 만들 수 없는 점 집합이면 경계 상자로 대신한다.
+    BodyId createCapsule(f32 halfHeight, f32 radius, const BodyDesc& desc); // halfHeight = half of the cylinder part
+    // Convex hull. For point sets that can't form one, a bounding box is used instead.
     BodyId createConvexHull(const Vec3* points, u32 count, const BodyDesc& desc);
     void destroy(BodyId body);
-    // 정적 바디를 다 만든 뒤 한 번 호출하면 브로드페이즈가 빨라진다.
+    // Calling once after creating all static bodies speeds up the broad phase.
     void optimize();
 
     void step(f32 dt, int collisionSteps = 1);
 
-    // 접촉 이벤트: minSpeed(m/s) 이상으로 새로 닿은 쌍을 step()마다 모은다. 0이면 끈다(기본, 비용 없음).
-    // 물리 작업 스레드가 모으고 step() 끝에서 세기 큰 순(같으면 바디 번호 순)으로 정렬해 maxPerStep개만 남긴다 → 스레드 수와 무관하게 같다.
+    // Contact events: collects pairs that newly touched at minSpeed (m/s) or more every step(). 0 turns it off (default, no cost).
+    // Physics worker threads collect them and at the end of step() they're sorted by strength (then body index) keeping maxPerStep → the same regardless of thread count.
     void setContactEvents(f32 minSpeed, u32 maxPerStep);
-    const std::vector<ContactEvent>& contacts() const; // 마지막 step()의 것
+    const std::vector<ContactEvent>& contacts() const; // from the last step()
 
     Vec3 position(BodyId body) const;
     Quat rotation(BodyId body) const;
@@ -100,26 +100,26 @@ public:
     Vec3 angularVelocity(BodyId body) const;
     void setLinearVelocity(BodyId body, Vec3 velocity);
     void setAngularVelocity(BodyId body, Vec3 velocity);
-    void addLinearVelocity(BodyId body, Vec3 delta); // 질량과 무관한 속도 변화
+    void addLinearVelocity(BodyId body, Vec3 delta); // velocity change independent of mass
     void setTransform(BodyId body, Vec3 position, Quat rotation);
     bool isActive(BodyId body) const;
 
-    // 광선: origin에서 direction(길이 = 최대 거리)만큼. ignore 바디는 무시한다.
+    // Ray: from origin along direction (length = max distance). The ignore body is ignored.
     bool castRay(Vec3 origin, Vec3 direction, RayHit& hit, BodyId ignore = kInvalidBody) const;
 
-    // 모든 바디 상태를 생성 순서대로 해시에 넣는다 (디싱크 감지용).
+    // Adds all body states to the hash in creation order (for desync detection).
     void hashState(Hasher& hasher) const;
-    // 해시에 넣는 값을 바디마다 한 줄로 (디싱크 덤프, game/DesyncDump.h): "body <순번> <id> p x y z q x y z w v x y z w x y z".
-    // 실수는 %.9g (float를 정확히 되읽는다)
+    // Values put into the hash, one line per body (desync dump, game/DesyncDump.h): "body <seq> <id> p x y z q x y z w v x y z w x y z".
+    // Floats as %.9g (reads back the float exactly)
     void writeState(std::string& out) const;
-    // 시험용: 처음 만든 움직이는 바디의 속도를 아주 조금 바꾼다 (--desync-test, 일부러 디싱크를 낸다)
+    // For tests: changes the velocity of the first created moving body very slightly (--desync-test, causes a desync on purpose)
     void nudgeForTest();
 
-    // 스냅샷 저장·복원. 복원하면 그 사이에 만들거나 지운 바디도 되돌린다 (바디 id까지 같게).
-    // 바디 id는 엔진이 정하는 순서로 매기므로(지운 번호를 정해진 순서로 다시 씀) 복원 뒤에 만드는 바디의 id도 원래와 같다.
+    // Snapshot save/restore. Restoring also reverts bodies created or deleted in between (with identical body ids).
+    // Body ids are assigned in an engine-defined order (deleted numbers are reused in a fixed order), so bodies created after a restore get the same ids as originally.
     void save(PhysicsSnapshot& out) const;
     bool restore(const PhysicsSnapshot& snapshot);
-    // 바디를 모두 지우고 id 할당을 처음으로 (다른 프로세스의 스냅샷을 복원하기 전: 같은 id에 다른 모양의 바디가 있을 수 있다)
+    // Deletes all bodies and resets id allocation (before restoring another process's snapshot: the same id may have a body with a different shape)
     void clearBodies();
     u32 bodyCount() const;
     u32 activeBodyCount() const;

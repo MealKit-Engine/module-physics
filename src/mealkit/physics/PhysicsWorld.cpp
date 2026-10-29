@@ -80,7 +80,7 @@ void traceToLog(const char* fmt, ...) {
     MEALKIT_INFO("[Jolt] %s", text);
 }
 
-// Jolt 상태를 바이트 배열에 쓰고 읽는다
+// Writes and reads Jolt state to/from a byte array
 class ByteStateRecorder final : public JPH::StateRecorder {
 public:
     explicit ByteStateRecorder(std::vector<u8>& data) : m_data(data) {}
@@ -134,16 +134,16 @@ Vec3 fromJ(JPH::RVec3Arg v) {
 }
 #endif
 
-// 만든 바디의 기록: 스냅샷을 되돌릴 때 사라진 바디를 같은 id로 다시 만든다
+// Record of created bodies: when restoring a snapshot, vanished bodies are recreated with the same id
 struct BodyRecord {
     JPH::BodyID id;
     JPH::RefConst<JPH::Shape> shape;
     BodyDesc desc;
 };
 
-// 바디 id 할당 상태 (스냅샷에 들어간다)
+// Body id allocation state (goes into snapshots)
 struct BodyIdAllocator {
-    std::vector<u32> free; // 다시 쓸 번호 (맨 뒤부터)
+    std::vector<u32> free; // numbers to reuse (from the back)
     std::vector<u8> sequence;
     u32 next = 0;
 };
@@ -209,7 +209,7 @@ bool readVector(JPH::StreamIn& in, std::vector<T>& v, u32 limit) {
 
 } // namespace
 
-// 바디마다 (id, BodyDesc, 모양). 모양은 Jolt 이진 형식이고 같은 모양은 한 번만 쓴다 (SaveWithChildren의 id 표)
+// Per body (id, BodyDesc, shape). Shapes are in Jolt binary format and identical shapes are written once (SaveWithChildren id table)
 void PhysicsSnapshot::write(std::vector<u8>& out) const {
     out.clear();
     if (!m) return;
@@ -277,7 +277,7 @@ void addBody(JPH::BodyInterface& bi, const BodyRecord& r) {
 
 } // namespace
 
-// 접촉 이벤트 모으기 (Jolt 작업 스레드에서 불린다)
+// Collects contact events (called from Jolt worker threads)
 class ContactCollector final : public JPH::ContactListener {
 public:
     f32 minSpeed = 0.0f;
@@ -289,7 +289,7 @@ public:
         if (minSpeed <= 0.0f || manifold.mRelativeContactPointsOn1.empty()) return;
         const JPH::RVec3 point = manifold.GetWorldSpaceContactPointOn1(0);
         const JPH::Vec3 relative = body1.GetPointVelocity(point) - body2.GetPointVelocity(point);
-        const f32 speed = relative.Dot(manifold.mWorldSpaceNormal); // 법선은 1 → 2
+        const f32 speed = relative.Dot(manifold.mWorldSpaceNormal); // the normal is 1 → 2
         if (speed < minSpeed) return;
         BodyId a = body1.GetID().GetIndexAndSequenceNumber(), b = body2.GetID().GetIndexAndSequenceNumber();
         if (b < a) std::swap(a, b);
@@ -308,7 +308,7 @@ struct PhysicsWorld::Impl {
     JPH::PhysicsSystem system;
     JPH::TempAllocatorImpl tempAllocator{16 * 1024 * 1024};
     JPH::JobSystemThreadPool* jobs = nullptr;
-    std::vector<BodyRecord> bodies; // 생성 순서 (해시, 스냅샷)
+    std::vector<BodyRecord> bodies; // creation order (hash, snapshots)
     BodyIdAllocator ids;
     u32 threads = 0;
 
@@ -346,7 +346,7 @@ bool PhysicsWorld::init(u32 maxBodies, u32 threads) {
     m = new Impl();
     if (threads == 0) {
         const u32 cores = std::max(1u, std::thread::hardware_concurrency());
-        threads = std::clamp(cores - 1, 1u, 6u); // 메인 스레드 하나는 남긴다
+        threads = std::clamp(cores - 1, 1u, 6u); // leave one for the main thread
     }
     m->threads = threads;
     m->jobs = new JPH::JobSystemThreadPool(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, static_cast<int>(threads));
@@ -412,7 +412,7 @@ void PhysicsWorld::destroy(BodyId body) {
     m->remove(id);
     m->bodies.erase(it);
     const u32 index = id.GetIndex();
-    ++m->ids.sequence[index]; // 같은 번호를 다시 쓰면 다른 id가 되게
+    ++m->ids.sequence[index]; // so reusing the same number gives a different id
     m->ids.free.push_back(index);
 }
 
@@ -424,7 +424,7 @@ void PhysicsWorld::step(f32 dt, int collisionSteps) {
     events.clear();
     m->system.Update(dt, collisionSteps, &m->tempAllocator, m->jobs);
     if (events.empty()) return;
-    // 모은 순서는 스레드마다 다르다: 세기 → 바디 번호 → 위치로 정렬해 같은 결과를 만든다
+    // Collection order differs per thread: sort by strength → body index → position to get the same result
     std::sort(events.begin(), events.end(), [](const ContactEvent& x, const ContactEvent& y) {
         if (x.speed != y.speed) return x.speed > y.speed;
         if (x.a != y.a) return x.a < y.a;
@@ -454,7 +454,7 @@ void PhysicsWorld::setAngularVelocity(BodyId body, Vec3 v) { m->bi().SetAngularV
 
 void PhysicsWorld::addLinearVelocity(BodyId body, Vec3 delta) {
     const JPH::BodyID id(body);
-    m->bi().SetLinearVelocity(id, m->bi().GetLinearVelocity(id) + toJ(delta)); // 잠든 바디도 깨운다
+    m->bi().SetLinearVelocity(id, m->bi().GetLinearVelocity(id) + toJ(delta)); // also wakes sleeping bodies
 }
 
 void PhysicsWorld::setTransform(BodyId body, Vec3 position, Quat rotation) {
@@ -529,14 +529,14 @@ bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
     auto contains = [](const std::vector<BodyRecord>& list, const JPH::BodyID& id) {
         return std::any_of(list.begin(), list.end(), [&](const BodyRecord& r) { return r.id == id; });
     };
-    // 스냅샷 뒤에 만든 바디는 지우고, 스냅샷 뒤에 지운 바디는 같은 id로 다시 만든다
+    // Bodies created after the snapshot are deleted, and bodies deleted after the snapshot are recreated with the same id
     for (const BodyRecord& r : m->bodies)
         if (!contains(s.records, r.id)) m->remove(r.id);
     for (const BodyRecord& r : s.records)
         if (!contains(m->bodies, r.id)) addBody(m->bi(), r);
     m->bodies = s.records;
     m->ids = s.ids;
-    std::vector<u8> bytes = s.jolt; // StateRecorder는 읽기 위치를 가진다
+    std::vector<u8> bytes = s.jolt; // StateRecorder has a read position
     ByteStateRecorder recorder(bytes);
     if (!m->system.RestoreState(recorder)) {
         MEALKIT_ERROR("Physics: RestoreState failed");
