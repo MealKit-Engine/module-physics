@@ -28,6 +28,7 @@ struct BodyDesc {
     f32 mass = 0.0f;           // 0 = computed from shape and density (1000 kg/m³)
     bool lockRotation = false; // for characters: prevents rotation so they don't fall over
     bool allowSleep = true;
+    u32 group = 0;             // bodies with the same nonzero group don't collide with each other (ragdoll parts)
 };
 
 // Kinematic character (Jolt CharacterVirtual): moved by sweeping its capsule, walks stairs and slopes and sticks to the floor.
@@ -49,6 +50,25 @@ struct CharacterGround {
     bool supported = false; // standing on walkable ground
     Vec3 normal;
     Vec3 velocity; // velocity of what it stands on (moving platforms)
+};
+
+// Motorized joint between two bodies (Jolt SwingTwistConstraint): a ball joint with a cone and twist limit,
+// whose motor springs the child toward a target rotation relative to the parent (active ragdolls, sim/Ragdoll.h).
+// Joints (targets, torques, Jolt solver state) are in hashState and snapshots. Created/destroyed in a fixed order like bodies.
+using JointId = u32;
+inline constexpr JointId kInvalidJoint = 0xFFFFFFFFu;
+
+struct JointDesc {
+    Vec3 pivot;                     // world position at creation
+    Vec3 twistAxis{0.0f, -1.0f, 0.0f}; // world, along the child bone (from parent toward child)
+    Vec3 planeAxis{1.0f, 0.0f, 0.0f};  // world, perpendicular to twistAxis
+    f32 normalCone = 0.8f;          // half cone angles and twist range (radians)
+    f32 planeCone = 0.8f;
+    f32 twistMin = -0.5f;
+    f32 twistMax = 0.5f;
+    f32 motorFrequency = 6.0f;      // motor spring (Hz) and damping ratio
+    f32 motorDamping = 1.0f;
+    f32 maxTorque = 400.0f;         // N·m, 0 = limp
 };
 
 struct RayHit {
@@ -116,6 +136,14 @@ public:
     void setCharacterVelocity(CharacterId character, Vec3 velocity);
     CharacterGround characterGround(CharacterId character) const;
     BodyId characterBody(CharacterId character) const; // the kinematic body that follows it
+
+    // Joints: parent and child must exist. Destroy joints before their bodies.
+    JointId createJoint(BodyId parent, BodyId child, const JointDesc& desc);
+    void destroyJoint(JointId joint);
+    // Motor target: child rotation relative to the parent (child = parent * target, identity = same rotation as the parent)
+    void setJointTarget(JointId joint, Quat target);
+    void setJointTorque(JointId joint, f32 maxTorque); // 0 = limp (limits still hold)
+    u32 jointCount() const;
     // Calling once after creating all static bodies speeds up the broad phase.
     void optimize();
 
@@ -136,8 +164,8 @@ public:
     void setTransform(BodyId body, Vec3 position, Quat rotation);
     bool isActive(BodyId body) const;
 
-    // Ray: from origin along direction (length = max distance). The ignore body is ignored.
-    bool castRay(Vec3 origin, Vec3 direction, RayHit& hit, BodyId ignore = kInvalidBody) const;
+    // Ray: from origin along direction (length = max distance). The ignore body and bodies of ignoreGroup (if nonzero) are ignored.
+    bool castRay(Vec3 origin, Vec3 direction, RayHit& hit, BodyId ignore = kInvalidBody, u32 ignoreGroup = 0) const;
 
     // Adds all body states to the hash in creation order (for desync detection).
     void hashState(Hasher& hasher) const;

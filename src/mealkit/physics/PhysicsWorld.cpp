@@ -13,11 +13,13 @@
 #include <Jolt/Physics/Character/CharacterVirtual.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
+#include <Jolt/Physics/Collision/GroupFilter.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
+#include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/PhysicsSettings.h>
 #include <Jolt/Physics/PhysicsSystem.h>
 #include <Jolt/Physics/StateRecorder.h>
@@ -164,6 +166,51 @@ struct CharacterSave {
     std::vector<u8> state;
 };
 
+// A joint as created (body-space frames, so it can be recreated in any pose) + its current motor values.
+// POD: copied as is into snapshots
+struct JointState {
+    JointId id = kInvalidJoint;
+    BodyId parent = kInvalidBody;
+    BodyId child = kInvalidBody;
+    JointDesc desc;
+    Vec3 position1, twist1, plane1; // in the parent's body space
+    Vec3 position2, twist2, plane2; // in the child's body space
+    Quat target;
+    f32 torque = 0.0f;
+};
+
+struct JointRecord {
+    JointState state;
+    JPH::Ref<JPH::SwingTwistConstraint> constraint;
+};
+
+// BodyDesc::group: bodies sharing a nonzero group never collide (no sub-group pairs: a ragdoll ignores itself entirely)
+class SameGroupFilter final : public JPH::GroupFilter {
+public:
+    bool CanCollide(const JPH::CollisionGroup& a, const JPH::CollisionGroup& b) const override {
+        return a.GetGroupID() == JPH::CollisionGroup::cInvalidGroup || a.GetGroupID() != b.GetGroupID();
+    }
+};
+
+const JPH::GroupFilter* sameGroupFilter() {
+    static JPH::Ref<SameGroupFilter> filter = new SameGroupFilter();
+    return filter;
+}
+
+// Ray filter: one body and one group
+class RayBodyFilter final : public JPH::BodyFilter {
+public:
+    RayBodyFilter(JPH::BodyID ignore, u32 group) : m_ignore(ignore), m_group(group) {}
+    bool ShouldCollide(const JPH::BodyID& id) const override { return id != m_ignore; }
+    bool ShouldCollideLocked(const JPH::Body& body) const override {
+        return m_group == 0 || body.GetCollisionGroup().GetGroupID() != m_group;
+    }
+
+private:
+    JPH::BodyID m_ignore;
+    u32 m_group;
+};
+
 JPH::BodyCreationSettings makeSettings(const JPH::Shape* shape, const BodyDesc& d) {
     const JPH::EMotionType motion = d.motion == Motion::Static    ? JPH::EMotionType::Static
                                     : d.motion == Motion::Dynamic ? JPH::EMotionType::Dynamic
@@ -175,6 +222,7 @@ JPH::BodyCreationSettings makeSettings(const JPH::Shape* shape, const BodyDesc& 
     s.mLinearDamping = d.linearDamping;
     s.mAngularDamping = d.angularDamping;
     s.mAllowSleeping = d.allowSleep;
+    if (d.group != 0) s.mCollisionGroup = JPH::CollisionGroup(sameGroupFilter(), d.group, 0);
     if (d.lockRotation)
         s.mAllowedDOFs =
             JPH::EAllowedDOFs::TranslationX | JPH::EAllowedDOFs::TranslationY | JPH::EAllowedDOFs::TranslationZ;
@@ -193,6 +241,8 @@ struct PhysicsSnapshot::Impl {
     std::vector<u8> jolt;
     std::vector<CharacterSave> characters;
     u32 nextCharacter = 0;
+    std::vector<JointState> joints; // in Jolt's constraint order
+    u32 nextJoint = 0;
 };
 
 PhysicsSnapshot::PhysicsSnapshot() = default;
@@ -252,6 +302,8 @@ void PhysicsSnapshot::write(std::vector<u8>& out) const {
         writeValue(stream, c.body);
         writeVector(stream, c.state);
     }
+    writeValue(stream, m->nextJoint);
+    writeVector(stream, m->joints);
 }
 
 bool PhysicsSnapshot::read(const u8* data, size_t size) {
@@ -296,6 +348,8 @@ bool PhysicsSnapshot::read(const u8* data, size_t size) {
         stream.ReadBytes(&c.body, sizeof(c.body));
         if (!readVector(stream, c.state, kLimit)) return false;
     }
+    stream.ReadBytes(&loaded.nextJoint, sizeof(loaded.nextJoint));
+    if (stream.IsFailed() || !readVector(stream, loaded.joints, kLimit)) return false;
     if (!m) m = new Impl();
     *m = std::move(loaded);
     return true;
@@ -349,6 +403,8 @@ struct PhysicsWorld::Impl {
     BodyIdAllocator ids;
     std::vector<CharacterRecord> characters; // creation order (declared after system: released first)
     u32 nextCharacter = 0;
+    std::vector<JointRecord> joints; // mirrors Jolt's constraint array order (swap-remove like Jolt)
+    u32 nextJoint = 0;
     u32 threads = 0;
 
     JPH::Ref<JPH::CharacterVirtual> makeCharacter(const CharacterDesc& d) {
@@ -370,6 +426,45 @@ struct PhysicsWorld::Impl {
         for (const CharacterRecord& c : characters)
             if (c.id == id) return &c;
         return nullptr;
+    }
+
+    JPH::Ref<JPH::SwingTwistConstraint> makeJoint(const JointState& j) {
+        JPH::SwingTwistConstraintSettings s;
+        s.mSpace = JPH::EConstraintSpace::LocalToBodyCOM;
+        s.mPosition1 = toJR(j.position1);
+        s.mTwistAxis1 = toJ(j.twist1);
+        s.mPlaneAxis1 = toJ(j.plane1);
+        s.mPosition2 = toJR(j.position2);
+        s.mTwistAxis2 = toJ(j.twist2);
+        s.mPlaneAxis2 = toJ(j.plane2);
+        s.mNormalHalfConeAngle = j.desc.normalCone;
+        s.mPlaneHalfConeAngle = j.desc.planeCone;
+        s.mTwistMinAngle = j.desc.twistMin;
+        s.mTwistMaxAngle = j.desc.twistMax;
+        for (JPH::MotorSettings* motor : {&s.mSwingMotorSettings, &s.mTwistMotorSettings}) {
+            motor->mSpringSettings =
+                JPH::SpringSettings(JPH::ESpringMode::FrequencyAndDamping, j.desc.motorFrequency, j.desc.motorDamping);
+            motor->SetTorqueLimit(j.torque);
+        }
+        JPH::Constraint* c = bi().CreateConstraint(&s, JPH::BodyID(j.parent), JPH::BodyID(j.child));
+        if (!c) return nullptr;
+        JPH::Ref<JPH::SwingTwistConstraint> joint = static_cast<JPH::SwingTwistConstraint*>(c);
+        joint->SetSwingMotorState(JPH::EMotorState::Position);
+        joint->SetTwistMotorState(JPH::EMotorState::Position);
+        joint->SetTargetOrientationBS(toJ(j.target));
+        system.AddConstraint(joint);
+        return joint;
+    }
+
+    JointRecord* joint(JointId id) {
+        for (JointRecord& j : joints)
+            if (j.state.id == id) return &j;
+        return nullptr;
+    }
+
+    void removeAllJoints() {
+        for (JointRecord& j : joints) system.RemoveConstraint(j.constraint);
+        joints.clear();
     }
 
     JPH::BodyInterface& bi() { return system.GetBodyInterfaceNoLock(); }
@@ -419,6 +514,7 @@ bool PhysicsWorld::init(u32 maxBodies, u32 threads) {
 
 void PhysicsWorld::shutdown() {
     if (!m) return;
+    m->removeAllJoints();
     m->characters.clear();
     for (const BodyRecord& r : m->bodies) m->remove(r.id);
     delete m->jobs;
@@ -542,6 +638,58 @@ BodyId PhysicsWorld::characterBody(CharacterId character) const {
     return c ? c->body : kInvalidBody;
 }
 
+JointId PhysicsWorld::createJoint(BodyId parent, BodyId child, const JointDesc& desc) {
+    const JPH::BodyID p(parent), c(child);
+    const JPH::RMat44 parentInv = m->bi().GetCenterOfMassTransform(p).InversedRotationTranslation();
+    const JPH::RMat44 childInv = m->bi().GetCenterOfMassTransform(c).InversedRotationTranslation();
+    JointState j;
+    j.id = m->nextJoint++;
+    j.parent = parent;
+    j.child = child;
+    j.desc = desc;
+    j.position1 = fromJ(JPH::Vec3(parentInv * toJR(desc.pivot)));
+    j.twist1 = fromJ(parentInv.Multiply3x3(toJ(desc.twistAxis)));
+    j.plane1 = fromJ(parentInv.Multiply3x3(toJ(desc.planeAxis)));
+    j.position2 = fromJ(JPH::Vec3(childInv * toJR(desc.pivot)));
+    j.twist2 = fromJ(childInv.Multiply3x3(toJ(desc.twistAxis)));
+    j.plane2 = fromJ(childInv.Multiply3x3(toJ(desc.planeAxis)));
+    j.target = fromJ(m->bi().GetRotation(p).Conjugated() * m->bi().GetRotation(c)); // holds the created pose
+    j.torque = desc.maxTorque;
+    JPH::Ref<JPH::SwingTwistConstraint> constraint = m->makeJoint(j);
+    if (!constraint) {
+        MEALKIT_ERROR("Physics: joint between bodies %08x and %08x could not be created", parent, child);
+        return kInvalidJoint;
+    }
+    m->joints.push_back({j, constraint});
+    return j.id;
+}
+
+void PhysicsWorld::destroyJoint(JointId joint) {
+    auto it = std::find_if(m->joints.begin(), m->joints.end(), [&](const JointRecord& j) { return j.state.id == joint; });
+    if (it == m->joints.end()) return;
+    m->system.RemoveConstraint(it->constraint);
+    // Same swap-remove as Jolt's constraint array, so the order stays equal (snapshots restore by index)
+    if (it != m->joints.end() - 1) *it = std::move(m->joints.back());
+    m->joints.pop_back();
+}
+
+void PhysicsWorld::setJointTarget(JointId joint, Quat target) {
+    JointRecord* j = m->joint(joint);
+    if (!j) return;
+    j->state.target = target;
+    j->constraint->SetTargetOrientationBS(toJ(target));
+}
+
+void PhysicsWorld::setJointTorque(JointId joint, f32 maxTorque) {
+    JointRecord* j = m->joint(joint);
+    if (!j || j->state.torque == maxTorque) return;
+    j->state.torque = maxTorque;
+    j->constraint->GetSwingMotorSettings().SetTorqueLimit(maxTorque);
+    j->constraint->GetTwistMotorSettings().SetTorqueLimit(maxTorque);
+}
+
+u32 PhysicsWorld::jointCount() const { return static_cast<u32>(m->joints.size()); }
+
 void PhysicsWorld::optimize() { m->system.OptimizeBroadPhase(); }
 
 void PhysicsWorld::step(f32 dt, int collisionSteps) {
@@ -589,11 +737,10 @@ void PhysicsWorld::setTransform(BodyId body, Vec3 position, Quat rotation) {
 
 bool PhysicsWorld::isActive(BodyId body) const { return m->bi().IsActive(JPH::BodyID(body)); }
 
-bool PhysicsWorld::castRay(Vec3 origin, Vec3 direction, RayHit& hit, BodyId ignore) const {
+bool PhysicsWorld::castRay(Vec3 origin, Vec3 direction, RayHit& hit, BodyId ignore, u32 ignoreGroup) const {
     const JPH::RRayCast ray{toJR(origin), toJ(direction)};
     JPH::RayCastResult result;
-    const JPH::IgnoreSingleBodyFilter filter(
-        JPH::BodyID(ignore == kInvalidBody ? JPH::BodyID::cInvalidBodyID : ignore));
+    const RayBodyFilter filter(JPH::BodyID(ignore == kInvalidBody ? JPH::BodyID::cInvalidBodyID : ignore), ignoreGroup);
     if (!m->system.GetNarrowPhaseQueryNoLock().CastRay(ray, result, {}, {}, filter)) return false;
     hit.body = result.mBodyID.GetIndexAndSequenceNumber();
     hit.fraction = result.mFraction;
@@ -620,6 +767,11 @@ void PhysicsWorld::hashState(Hasher& hasher) const {
         hasher.add(fromJ(c.character->GetLinearVelocity()));
         hasher.add(static_cast<u32>(c.character->GetGroundState()));
     }
+    for (const JointRecord& j : m->joints) {
+        hasher.add(j.state.id);
+        hasher.add(j.state.target);
+        hasher.add(j.state.torque);
+    }
 }
 
 void PhysicsWorld::writeState(std::string& out) const {
@@ -641,6 +793,12 @@ void PhysicsWorld::writeState(std::string& out) const {
         const Vec3 v = fromJ(c.character->GetLinearVelocity());
         std::snprintf(line, sizeof(line), "character %u p %.9g %.9g %.9g v %.9g %.9g %.9g ground %u\n", c.id, p.x, p.y, p.z,
                       v.x, v.y, v.z, static_cast<u32>(c.character->GetGroundState()));
+        out += line;
+    }
+    for (const JointRecord& j : m->joints) {
+        const Quat q = j.state.target;
+        std::snprintf(line, sizeof(line), "joint %u %08x %08x target %.9g %.9g %.9g %.9g torque %.9g\n", j.state.id,
+                      j.state.parent, j.state.child, q.x, q.y, q.z, q.w, j.state.torque);
         out += line;
     }
 }
@@ -668,6 +826,9 @@ void PhysicsWorld::save(PhysicsSnapshot& out) const {
         out.m->characters.push_back(std::move(save));
     }
     out.m->nextCharacter = m->nextCharacter;
+    out.m->joints.clear();
+    for (const JointRecord& j : m->joints) out.m->joints.push_back(j.state);
+    out.m->nextJoint = m->nextJoint;
 }
 
 bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
@@ -676,6 +837,8 @@ bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
     auto contains = [](const std::vector<BodyRecord>& list, const JPH::BodyID& id) {
         return std::any_of(list.begin(), list.end(), [&](const BodyRecord& r) { return r.id == id; });
     };
+    // Joints are rebuilt from the snapshot after the bodies (in its order, which is then Jolt's order too)
+    m->removeAllJoints();
     // Bodies created after the snapshot are deleted, and bodies deleted after the snapshot are recreated with the same id
     for (const BodyRecord& r : m->bodies)
         if (!contains(s.records, r.id)) m->remove(r.id);
@@ -683,6 +846,8 @@ bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
         if (!contains(m->bodies, r.id)) addBody(m->bi(), r);
     m->bodies = s.records;
     m->ids = s.ids;
+    for (const JointState& j : s.joints) m->joints.push_back({j, m->makeJoint(j)});
+    m->nextJoint = s.nextJoint;
     std::vector<u8> bytes = s.jolt; // StateRecorder has a read position
     ByteStateRecorder recorder(bytes);
     if (!m->system.RestoreState(recorder)) {
@@ -710,6 +875,8 @@ bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
 }
 
 void PhysicsWorld::clearBodies() {
+    m->removeAllJoints();
+    m->nextJoint = 0;
     m->characters.clear();
     m->nextCharacter = 0;
     for (const BodyRecord& r : m->bodies) m->remove(r.id);
