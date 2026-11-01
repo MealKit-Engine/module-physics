@@ -10,6 +10,7 @@
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyFilter.h>
+#include <Jolt/Physics/Character/CharacterVirtual.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/RayCast.h>
@@ -148,6 +149,21 @@ struct BodyIdAllocator {
     u32 next = 0;
 };
 
+struct CharacterRecord {
+    CharacterId id = kInvalidCharacter;
+    CharacterDesc desc;
+    BodyId body = kInvalidBody;
+    JPH::Ref<JPH::CharacterVirtual> character;
+};
+
+// A character in a snapshot: Jolt CharacterVirtual::SaveState bytes (position, velocity, contacts, ground)
+struct CharacterSave {
+    CharacterId id = kInvalidCharacter;
+    CharacterDesc desc;
+    BodyId body = kInvalidBody;
+    std::vector<u8> state;
+};
+
 JPH::BodyCreationSettings makeSettings(const JPH::Shape* shape, const BodyDesc& d) {
     const JPH::EMotionType motion = d.motion == Motion::Static    ? JPH::EMotionType::Static
                                     : d.motion == Motion::Dynamic ? JPH::EMotionType::Dynamic
@@ -175,6 +191,8 @@ struct PhysicsSnapshot::Impl {
     std::vector<BodyRecord> records;
     BodyIdAllocator ids;
     std::vector<u8> jolt;
+    std::vector<CharacterSave> characters;
+    u32 nextCharacter = 0;
 };
 
 PhysicsSnapshot::PhysicsSnapshot() = default;
@@ -226,6 +244,14 @@ void PhysicsSnapshot::write(std::vector<u8>& out) const {
     writeVector(stream, m->ids.free);
     writeVector(stream, m->ids.sequence);
     writeVector(stream, m->jolt);
+    writeValue(stream, m->nextCharacter);
+    writeValue(stream, static_cast<u32>(m->characters.size()));
+    for (const CharacterSave& c : m->characters) {
+        writeValue(stream, c.id);
+        writeValue(stream, c.desc);
+        writeValue(stream, c.body);
+        writeVector(stream, c.state);
+    }
 }
 
 bool PhysicsSnapshot::read(const u8* data, size_t size) {
@@ -259,6 +285,17 @@ bool PhysicsSnapshot::read(const u8* data, size_t size) {
     if (!readVector(stream, loaded.ids.free, kLimit) || !readVector(stream, loaded.ids.sequence, kLimit) ||
         !readVector(stream, loaded.jolt, 1u << 30))
         return false;
+    u32 characters = 0;
+    stream.ReadBytes(&loaded.nextCharacter, sizeof(loaded.nextCharacter));
+    stream.ReadBytes(&characters, sizeof(characters));
+    if (stream.IsFailed() || characters > kLimit) return false;
+    loaded.characters.resize(characters);
+    for (CharacterSave& c : loaded.characters) {
+        stream.ReadBytes(&c.id, sizeof(c.id));
+        stream.ReadBytes(&c.desc, sizeof(c.desc));
+        stream.ReadBytes(&c.body, sizeof(c.body));
+        if (!readVector(stream, c.state, kLimit)) return false;
+    }
     if (!m) m = new Impl();
     *m = std::move(loaded);
     return true;
@@ -310,7 +347,30 @@ struct PhysicsWorld::Impl {
     JPH::JobSystemThreadPool* jobs = nullptr;
     std::vector<BodyRecord> bodies; // creation order (hash, snapshots)
     BodyIdAllocator ids;
+    std::vector<CharacterRecord> characters; // creation order (declared after system: released first)
+    u32 nextCharacter = 0;
     u32 threads = 0;
+
+    JPH::Ref<JPH::CharacterVirtual> makeCharacter(const CharacterDesc& d) {
+        JPH::CharacterVirtualSettings s;
+        s.mShape = new JPH::CapsuleShape(std::max(d.halfHeight, 0.01f), std::max(d.radius, 0.01f));
+        s.mMaxSlopeAngle = JPH::ACos(std::clamp(d.maxSlopeCos, 0.0f, 1.0f)); // Jolt's own ACos/Cos (deterministic)
+        s.mSupportingVolume = JPH::Plane(JPH::Vec3::sAxisY(), d.halfHeight); // only the lower hemisphere supports
+        s.mMass = d.mass;
+        s.mMaxStrength = d.maxStrength;
+        return new JPH::CharacterVirtual(&s, toJR(d.position), JPH::Quat::sIdentity(), &system);
+    }
+
+    CharacterRecord* character(CharacterId id) {
+        for (CharacterRecord& c : characters)
+            if (c.id == id) return &c;
+        return nullptr;
+    }
+    const CharacterRecord* character(CharacterId id) const {
+        for (const CharacterRecord& c : characters)
+            if (c.id == id) return &c;
+        return nullptr;
+    }
 
     JPH::BodyInterface& bi() { return system.GetBodyInterfaceNoLock(); }
     const JPH::BodyInterface& bi() const { return system.GetBodyInterfaceNoLock(); }
@@ -359,6 +419,7 @@ bool PhysicsWorld::init(u32 maxBodies, u32 threads) {
 
 void PhysicsWorld::shutdown() {
     if (!m) return;
+    m->characters.clear();
     for (const BodyRecord& r : m->bodies) m->remove(r.id);
     delete m->jobs;
     delete m;
@@ -414,6 +475,71 @@ void PhysicsWorld::destroy(BodyId body) {
     const u32 index = id.GetIndex();
     ++m->ids.sequence[index]; // so reusing the same number gives a different id
     m->ids.free.push_back(index);
+}
+
+CharacterId PhysicsWorld::createCharacter(const CharacterDesc& desc) {
+    BodyDesc b;
+    b.motion = Motion::Kinematic;
+    b.position = desc.position;
+    b.allowSleep = false;
+    CharacterRecord c;
+    c.id = m->nextCharacter++;
+    c.desc = desc;
+    c.body = m->add(new JPH::CapsuleShape(std::max(desc.halfHeight, 0.01f), std::max(desc.radius, 0.01f)), b);
+    c.character = m->makeCharacter(desc);
+    m->characters.push_back(std::move(c));
+    return m->characters.back().id;
+}
+
+void PhysicsWorld::destroyCharacter(CharacterId character) {
+    auto it = std::find_if(m->characters.begin(), m->characters.end(),
+                           [&](const CharacterRecord& c) { return c.id == character; });
+    if (it == m->characters.end()) return;
+    const BodyId body = it->body;
+    m->characters.erase(it);
+    destroy(body);
+}
+
+void PhysicsWorld::moveCharacter(CharacterId character, Vec3 velocity, Vec3 gravity, f32 dt, f32 stepUp, f32 stickDown) {
+    CharacterRecord* c = m->character(character);
+    if (!c) return;
+    c->character->SetLinearVelocity(toJ(velocity));
+    JPH::CharacterVirtual::ExtendedUpdateSettings settings;
+    settings.mStickToFloorStepDown = JPH::Vec3(0.0f, -stickDown, 0.0f);
+    settings.mWalkStairsStepUp = JPH::Vec3(0.0f, stepUp, 0.0f);
+    const JPH::IgnoreSingleBodyFilter self{JPH::BodyID(c->body)}; // not its own following body
+    c->character->ExtendedUpdate(dt, toJ(gravity), settings, m->system.GetDefaultBroadPhaseLayerFilter(Layers::Moving),
+                                 m->system.GetDefaultLayerFilter(Layers::Moving), self, {}, m->tempAllocator);
+    m->bi().MoveKinematic(JPH::BodyID(c->body), c->character->GetPosition(), JPH::Quat::sIdentity(), dt);
+}
+
+Vec3 PhysicsWorld::characterPosition(CharacterId character) const {
+    const CharacterRecord* c = m->character(character);
+    return c ? fromJ(c->character->GetPosition()) : Vec3{};
+}
+
+Vec3 PhysicsWorld::characterVelocity(CharacterId character) const {
+    const CharacterRecord* c = m->character(character);
+    return c ? fromJ(c->character->GetLinearVelocity()) : Vec3{};
+}
+
+void PhysicsWorld::setCharacterVelocity(CharacterId character, Vec3 velocity) {
+    if (CharacterRecord* c = m->character(character)) c->character->SetLinearVelocity(toJ(velocity));
+}
+
+CharacterGround PhysicsWorld::characterGround(CharacterId character) const {
+    CharacterGround g;
+    const CharacterRecord* c = m->character(character);
+    if (!c) return g;
+    g.supported = c->character->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround;
+    g.normal = fromJ(c->character->GetGroundNormal());
+    g.velocity = fromJ(c->character->GetGroundVelocity());
+    return g;
+}
+
+BodyId PhysicsWorld::characterBody(CharacterId character) const {
+    const CharacterRecord* c = m->character(character);
+    return c ? c->body : kInvalidBody;
 }
 
 void PhysicsWorld::optimize() { m->system.OptimizeBroadPhase(); }
@@ -488,6 +614,12 @@ void PhysicsWorld::hashState(Hasher& hasher) const {
         hasher.add(v);
         hasher.add(w);
     }
+    for (const CharacterRecord& c : m->characters) {
+        hasher.add(c.id);
+        hasher.add(fromJ(c.character->GetPosition()));
+        hasher.add(fromJ(c.character->GetLinearVelocity()));
+        hasher.add(static_cast<u32>(c.character->GetGroundState()));
+    }
 }
 
 void PhysicsWorld::writeState(std::string& out) const {
@@ -502,6 +634,13 @@ void PhysicsWorld::writeState(std::string& out) const {
         std::snprintf(line, sizeof(line),
                       "body %u %08x p %.9g %.9g %.9g q %.9g %.9g %.9g %.9g v %.9g %.9g %.9g w %.9g %.9g %.9g\n", index++,
                       r.id.GetIndexAndSequenceNumber(), p.x, p.y, p.z, q.x, q.y, q.z, q.w, v.x, v.y, v.z, w.x, w.y, w.z);
+        out += line;
+    }
+    for (const CharacterRecord& c : m->characters) {
+        const Vec3 p = fromJ(c.character->GetPosition());
+        const Vec3 v = fromJ(c.character->GetLinearVelocity());
+        std::snprintf(line, sizeof(line), "character %u p %.9g %.9g %.9g v %.9g %.9g %.9g ground %u\n", c.id, p.x, p.y, p.z,
+                      v.x, v.y, v.z, static_cast<u32>(c.character->GetGroundState()));
         out += line;
     }
 }
@@ -521,6 +660,14 @@ void PhysicsWorld::save(PhysicsSnapshot& out) const {
     out.m->jolt.clear();
     ByteStateRecorder recorder(out.m->jolt);
     m->system.SaveState(recorder, JPH::EStateRecorderState::All);
+    out.m->characters.clear();
+    for (const CharacterRecord& c : m->characters) {
+        CharacterSave save{c.id, c.desc, c.body, {}};
+        ByteStateRecorder state(save.state);
+        c.character->SaveState(state);
+        out.m->characters.push_back(std::move(save));
+    }
+    out.m->nextCharacter = m->nextCharacter;
 }
 
 bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
@@ -542,10 +689,29 @@ bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
         MEALKIT_ERROR("Physics: RestoreState failed");
         return false;
     }
+    // Characters: same as bodies (their following bodies were restored above)
+    std::vector<CharacterRecord> characters;
+    characters.reserve(s.characters.size());
+    for (const CharacterSave& save : s.characters) {
+        CharacterRecord c;
+        if (CharacterRecord* existing = m->character(save.id)) c = std::move(*existing);
+        else c.character = m->makeCharacter(save.desc);
+        c.id = save.id;
+        c.desc = save.desc;
+        c.body = save.body;
+        std::vector<u8> state = save.state;
+        ByteStateRecorder in(state);
+        c.character->RestoreState(in);
+        characters.push_back(std::move(c));
+    }
+    m->characters = std::move(characters);
+    m->nextCharacter = s.nextCharacter;
     return true;
 }
 
 void PhysicsWorld::clearBodies() {
+    m->characters.clear();
+    m->nextCharacter = 0;
     for (const BodyRecord& r : m->bodies) m->remove(r.id);
     m->bodies.clear();
     const size_t maxBodies = m->ids.sequence.size();

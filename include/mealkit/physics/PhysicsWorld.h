@@ -30,6 +30,27 @@ struct BodyDesc {
     bool allowSleep = true;
 };
 
+// Kinematic character (Jolt CharacterVirtual): moved by sweeping its capsule, walks stairs and slopes and sticks to the floor.
+// It isn't a rigid body, so a kinematic capsule body of the same size follows it (other bodies, rays and contacts see that body).
+// Its state goes into hashState, writeState and snapshots like bodies. Created/moved in a fixed order like bodies.
+using CharacterId = u32;
+inline constexpr CharacterId kInvalidCharacter = 0xFFFFFFFFu;
+
+struct CharacterDesc {
+    Vec3 position;            // capsule center
+    f32 halfHeight = 0.45f;   // half of the cylinder part
+    f32 radius = 0.45f;
+    f32 mass = 80.0f;         // how hard it pushes dynamic bodies
+    f32 maxStrength = 500.0f; // max push force (N)
+    f32 maxSlopeCos = 0.64f;  // cos of the steepest walkable slope (no trig here: callers use detCos)
+};
+
+struct CharacterGround {
+    bool supported = false; // standing on walkable ground
+    Vec3 normal;
+    Vec3 velocity; // velocity of what it stands on (moving platforms)
+};
+
 struct RayHit {
     BodyId body = kInvalidBody;
     f32 fraction = 1.0f; // 0..1, fraction of the ray length
@@ -84,6 +105,17 @@ public:
     // Convex hull. For point sets that can't form one, a bounding box is used instead.
     BodyId createConvexHull(const Vec3* points, u32 count, const BodyDesc& desc);
     void destroy(BodyId body);
+
+    CharacterId createCharacter(const CharacterDesc& desc);
+    void destroyCharacter(CharacterId character);
+    // Moves the character with this velocity over dt: slides along walls, climbs steps up to stepUp, sticks to floors within stickDown.
+    // Call before step() in a fixed order. Its body follows during step().
+    void moveCharacter(CharacterId character, Vec3 velocity, Vec3 gravity, f32 dt, f32 stepUp, f32 stickDown);
+    Vec3 characterPosition(CharacterId character) const;
+    Vec3 characterVelocity(CharacterId character) const;
+    void setCharacterVelocity(CharacterId character, Vec3 velocity);
+    CharacterGround characterGround(CharacterId character) const;
+    BodyId characterBody(CharacterId character) const; // the kinematic body that follows it
     // Calling once after creating all static bodies speeds up the broad phase.
     void optimize();
 
