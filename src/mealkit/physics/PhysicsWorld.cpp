@@ -18,6 +18,7 @@
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
+#include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/PhysicsSettings.h>
@@ -560,6 +561,25 @@ BodyId PhysicsWorld::createConvexHull(const Vec3* points, u32 count, const BodyD
         return createBox((hi - lo) * 0.5f, shifted);
     }
     return m->add(result.Get(), desc);
+}
+
+BodyId PhysicsWorld::createHeightField(const f32* heights, u32 size, Vec3 offset, f32 spacingX, f32 spacingZ,
+                                       const BodyDesc& desc) {
+    if (size < 2) return kInvalidBody;
+    // Jolt wants the sample count to be a multiple of its block size (2, at least 4 samples): pad with no-collision samples
+    const u32 padded = std::max(4u, (size + 1) & ~1u);
+    std::vector<float> samples(static_cast<size_t>(padded) * padded, JPH::HeightFieldShapeConstants::cNoCollisionValue);
+    for (u32 z = 0; z < size; ++z)
+        std::memcpy(&samples[static_cast<size_t>(z) * padded], heights + static_cast<size_t>(z) * size, sizeof(f32) * size);
+    JPH::HeightFieldShapeSettings settings(samples.data(), toJ(offset), JPH::Vec3(spacingX, 1.0f, spacingZ), padded);
+    JPH::ShapeSettings::ShapeResult result = settings.Create();
+    if (result.HasError()) {
+        MEALKIT_ERROR("Physics: height field failed (%s)", result.GetError().c_str());
+        return kInvalidBody;
+    }
+    BodyDesc d = desc;
+    d.motion = Motion::Static;
+    return m->add(result.Get(), d);
 }
 
 void PhysicsWorld::destroy(BodyId body) {

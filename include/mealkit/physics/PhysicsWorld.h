@@ -124,6 +124,9 @@ public:
     BodyId createCapsule(f32 halfHeight, f32 radius, const BodyDesc& desc); // halfHeight = half of the cylinder part
     // Convex hull. For point sets that can't form one, a bounding box is used instead.
     BodyId createConvexHull(const Vec3* points, u32 count, const BodyDesc& desc);
+    // Height field (terrain, static): size x size heights in meters, grid order (index = z * size + x). Sample (x, z) is at
+    // desc.position + offset + (x * spacingX, height, z * spacingZ). Triangles split along (x, z)-(x + 1, z + 1)
+    BodyId createHeightField(const f32* heights, u32 size, Vec3 offset, f32 spacingX, f32 spacingZ, const BodyDesc& desc);
     void destroy(BodyId body);
 
     CharacterId createCharacter(const CharacterDesc& desc);
