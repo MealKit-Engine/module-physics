@@ -2,6 +2,7 @@
 
 #include "mealkit/core/Log.h"
 #include "mealkit/core/Profile.h"
+#include "mealkit/jobs/Jobs.h"
 
 #include <Jolt/Jolt.h>
 
@@ -399,7 +400,8 @@ struct PhysicsWorld::Impl {
     ObjectPairFilter objectPairs;
     JPH::PhysicsSystem system;
     JPH::TempAllocatorImpl tempAllocator{16 * 1024 * 1024};
-    JPH::JobSystemThreadPool* jobs = nullptr;
+    JPH::JobSystem* jobs = nullptr;           // the engine's shared pool (jobs::), or ownPool
+    JPH::JobSystemThreadPool* ownPool = nullptr; // only when init asked for an explicit thread count (thread count tests)
     std::vector<BodyRecord> bodies; // creation order (hash, snapshots)
     BodyIdAllocator ids;
     std::vector<CharacterRecord> characters; // creation order (declared after system: released first)
@@ -501,11 +503,14 @@ bool PhysicsWorld::init(u32 maxBodies, u32 threads) {
     acquireJolt();
     m = new Impl();
     if (threads == 0) {
-        const u32 cores = std::max(1u, std::thread::hardware_concurrency());
-        threads = std::clamp(cores - 1, 1u, 6u); // leave one for the main thread
+        jobs::acquire();
+        m->jobs = static_cast<JPH::JobSystem*>(jobs::joltJobSystem());
+        m->threads = jobs::workerCount();
+    } else {
+        m->ownPool = new JPH::JobSystemThreadPool(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, static_cast<int>(threads));
+        m->jobs = m->ownPool;
+        m->threads = threads;
     }
-    m->threads = threads;
-    m->jobs = new JPH::JobSystemThreadPool(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, static_cast<int>(threads));
     m->system.Init(maxBodies, 0, 65536, 20480, m->broadPhaseLayers, m->objectVsBroadPhase, m->objectPairs);
     m->bodies.reserve(maxBodies);
     m->ids.sequence.assign(maxBodies, 0);
@@ -518,9 +523,11 @@ void PhysicsWorld::shutdown() {
     m->removeAllJoints();
     m->characters.clear();
     for (const BodyRecord& r : m->bodies) m->remove(r.id);
-    delete m->jobs;
+    const bool shared = m->ownPool == nullptr;
+    delete m->ownPool;
     delete m;
     m = nullptr;
+    if (shared) jobs::release();
     releaseJolt();
 }
 

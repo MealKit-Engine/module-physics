@@ -113,7 +113,7 @@ public:
     PhysicsWorld(const PhysicsWorld&) = delete;
     PhysicsWorld& operator=(const PhysicsWorld&) = delete;
 
-    // threads = 0 matches the core count. The thread count doesn't affect determinism.
+    // threads = 0 uses the engine's shared job pool (mealkit/jobs/Jobs.h), N > 0 a private pool of N workers. The thread count doesn't affect determinism.
     bool init(u32 maxBodies = 16384, u32 threads = 0);
     void shutdown();
     bool initialized() const { return m != nullptr; }
