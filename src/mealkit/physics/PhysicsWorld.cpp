@@ -3,6 +3,7 @@
 #include "mealkit/core/Log.h"
 #include "mealkit/core/Profile.h"
 #include "mealkit/jobs/Jobs.h"
+#include "mealkit/jobs/JoltAllocator.h"
 
 #include <Jolt/Jolt.h>
 
@@ -115,7 +116,7 @@ int g_joltUsers = 0;
 
 void acquireJolt() {
     if (g_joltUsers++ > 0) return;
-    JPH::RegisterDefaultAllocator();
+    jobs::installJoltAllocator(); // shared with the job pool (jobs/JoltAllocator.h)
     JPH::Trace = traceToLog;
     JPH::Factory::sInstance = new JPH::Factory();
     JPH::RegisterTypes();
