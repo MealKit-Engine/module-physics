@@ -2,9 +2,10 @@
 # requires: modules this folder may include besides the kernel (core, platform, jobs), as name minVersion.
 @format engine-module 1
 name physics
-version 0.1.0
+version 0.1.1
 kernel 0.9
 kind sim
+layer core
 requires
 tag physics
 summary Jolt wrapper (bodies, queries, characters, ragdolls, snapshots)
