@@ -226,7 +226,9 @@ JPH::BodyCreationSettings makeSettings(const JPH::Shape* shape, const BodyDesc& 
     s.mAngularDamping = d.angularDamping;
     s.mAllowSleeping = d.allowSleep;
     if (d.group != 0) s.mCollisionGroup = JPH::CollisionGroup(sameGroupFilter(), d.group, 0);
-    if (d.lockRotation)
+    if (d.motion == Motion::Dynamic && d.plane2d) // rotation locked too: only the two plane translations
+        s.mAllowedDOFs = d.lockRotation ? JPH::EAllowedDOFs::TranslationX | JPH::EAllowedDOFs::TranslationY : JPH::EAllowedDOFs::Plane2D;
+    else if (d.lockRotation)
         s.mAllowedDOFs =
             JPH::EAllowedDOFs::TranslationX | JPH::EAllowedDOFs::TranslationY | JPH::EAllowedDOFs::TranslationZ;
     if (d.mass > 0.0f && d.motion == Motion::Dynamic) {
@@ -407,6 +409,7 @@ struct PhysicsWorld::Impl {
     BodyIdAllocator ids;
     std::vector<CharacterRecord> characters; // creation order (declared after system: released first)
     u32 nextCharacter = 0;
+    bool plane2d = false; // setPlane2D
     std::vector<JointRecord> joints; // mirrors Jolt's constraint array order (swap-remove like Jolt)
     u32 nextJoint = 0;
     u32 threads = 0;
@@ -486,6 +489,7 @@ struct PhysicsWorld::Impl {
             return kInvalidBody;
         }
         BodyRecord record{JPH::BodyID(index, ids.sequence[index]), shape, d};
+        record.desc.plane2d = record.desc.plane2d || plane2d;
         addBody(bi(), record);
         bodies.push_back(record);
         return record.id.GetIndexAndSequenceNumber();
@@ -533,6 +537,8 @@ void PhysicsWorld::shutdown() {
 }
 
 void PhysicsWorld::setGravity(Vec3 gravity) { m->system.SetGravity(toJ(gravity)); }
+void PhysicsWorld::setPlane2D(bool on) { m->plane2d = on; }
+bool PhysicsWorld::plane2D() const { return m && m->plane2d; }
 
 BodyId PhysicsWorld::createBox(Vec3 half, const BodyDesc& desc) {
     half = {std::max(half.x, 0.01f), std::max(half.y, 0.01f), std::max(half.z, 0.01f)};
@@ -627,6 +633,7 @@ void PhysicsWorld::destroyCharacter(CharacterId character) {
 void PhysicsWorld::moveCharacter(CharacterId character, Vec3 velocity, Vec3 gravity, f32 dt, f32 stepUp, f32 stickDown) {
     CharacterRecord* c = m->character(character);
     if (!c) return;
+    if (m->plane2d) velocity.z = 0.0f;
     c->character->SetLinearVelocity(toJ(velocity));
     JPH::CharacterVirtual::ExtendedUpdateSettings settings;
     settings.mStickToFloorStepDown = JPH::Vec3(0.0f, -stickDown, 0.0f);
@@ -634,6 +641,12 @@ void PhysicsWorld::moveCharacter(CharacterId character, Vec3 velocity, Vec3 grav
     const JPH::IgnoreSingleBodyFilter self{JPH::BodyID(c->body)}; // not its own following body
     c->character->ExtendedUpdate(dt, toJ(gravity), settings, m->system.GetDefaultBroadPhaseLayerFilter(Layers::Moving),
                                  m->system.GetDefaultLayerFilter(Layers::Moving), self, {}, m->tempAllocator);
+    if (m->plane2d) { // 2D: sliding along walls can push it off the plane
+        const JPH::RVec3 p = c->character->GetPosition();
+        c->character->SetPosition(JPH::RVec3(p.GetX(), p.GetY(), 0.0f));
+        const JPH::Vec3 v = c->character->GetLinearVelocity();
+        c->character->SetLinearVelocity(JPH::Vec3(v.GetX(), v.GetY(), 0.0f));
+    }
     m->bi().MoveKinematic(JPH::BodyID(c->body), c->character->GetPosition(), JPH::Quat::sIdentity(), dt);
 }
 

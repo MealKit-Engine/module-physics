@@ -27,6 +27,7 @@ struct BodyDesc {
     f32 angularDamping = 0.05f;
     f32 mass = 0.0f;           // 0 = computed from shape and density (1000 kg/m³)
     bool lockRotation = false; // for characters: prevents rotation so they don't fall over
+    bool plane2d = false;      // 2D: moves only in x/y and turns only about z (Jolt Plane2D). PhysicsWorld::setPlane2D sets it on every new body
     bool allowSleep = true;
     u32 group = 0;             // bodies with the same nonzero group don't collide with each other (ragdoll parts)
 };
@@ -119,6 +120,10 @@ public:
     bool initialized() const { return m != nullptr; }
 
     void setGravity(Vec3 gravity);
+    // 2D games (side view on the XY plane): dynamic bodies created after this move only in x/y and turn only about z,
+    // and characters stay at z = 0. Call right after init, before creating bodies (init turns it off)
+    void setPlane2D(bool on);
+    bool plane2D() const;
     BodyId createBox(Vec3 halfExtents, const BodyDesc& desc);
     BodyId createSphere(f32 radius, const BodyDesc& desc);
     BodyId createCapsule(f32 halfHeight, f32 radius, const BodyDesc& desc); // halfHeight = half of the cylinder part
