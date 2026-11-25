@@ -72,6 +72,32 @@ struct JointDesc {
     f32 maxTorque = 400.0f;         // N·m, 0 = limp
 };
 
+// Scene-placed link between two bodies (docs/DECISIONS.md 2026-11-25 "E7 joints"): a Jolt constraint of one of five kinds. A link isn't a ragdoll
+// joint: no motor, and it can break. Links (the broken flag, solver state) are in hashState and snapshots. Created in a fixed order like bodies.
+using LinkId = u32;
+inline constexpr LinkId kInvalidLink = 0xFFFFFFFFu;
+
+enum class LinkKind : u8 {
+    Hinge,  // turns about axis at pivot; limitMin/limitMax in radians from the creation pose (both 0 = free)
+    Slider, // slides along axis; limitMin/limitMax in meters from the creation pose (both 0 = free)
+    Spring, // soft distance between pivot (on A) and pivot2 (on B); length = rest length (0 = distance at creation)
+    Fixed,  // welds the two bodies in their creation pose
+    Rope    // pivot to pivot2 may not get farther than length (0 = distance at creation), slack otherwise
+};
+
+struct LinkDesc {
+    LinkKind kind = LinkKind::Hinge;
+    Vec3 pivot;                  // world anchor on body A at creation (and on B, except Spring and Rope)
+    Vec3 pivot2;                 // Spring and Rope: world anchor on body B
+    Vec3 axis{0.0f, 1.0f, 0.0f}; // Hinge and Slider: world axis
+    f32 limitMin = 0.0f;
+    f32 limitMax = 0.0f;
+    f32 length = 0.0f;
+    f32 frequency = 2.0f;        // Spring: Hz and damping ratio
+    f32 damping = 0.3f;
+    f32 breakForce = 0.0f;       // N, 0 = never breaks. Over this force in a step, the link turns off for good
+};
+
 struct RayHit {
     BodyId body = kInvalidBody;
     f32 fraction = 1.0f; // 0..1, fraction of the ray length
@@ -152,6 +178,11 @@ public:
     void setJointTarget(JointId joint, Quat target);
     void setJointTorque(JointId joint, f32 maxTorque); // 0 = limp (limits still hold)
     u32 jointCount() const;
+
+    // Links: a and b must exist. A static body is a fixed anchor. Destroy links before their bodies (clearBodies does it)
+    LinkId createLink(BodyId a, BodyId b, const LinkDesc& desc);
+    bool linkBroken(LinkId link) const;
+    u32 linkCount() const;
     // Calling once after creating all static bodies speeds up the broad phase.
     void optimize();
 

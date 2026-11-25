@@ -22,6 +22,10 @@
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
+#include <Jolt/Physics/Constraints/DistanceConstraint.h>
+#include <Jolt/Physics/Constraints/FixedConstraint.h>
+#include <Jolt/Physics/Constraints/HingeConstraint.h>
+#include <Jolt/Physics/Constraints/SliderConstraint.h>
 #include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/PhysicsSettings.h>
 #include <Jolt/Physics/PhysicsSystem.h>
@@ -187,6 +191,27 @@ struct JointRecord {
     JPH::Ref<JPH::SwingTwistConstraint> constraint;
 };
 
+// A link as created (body-space frames, so it can be recreated in any pose). POD: copied as is into snapshots
+struct LinkState {
+    LinkId id = kInvalidLink;
+    BodyId a = kInvalidBody;
+    BodyId b = kInvalidBody;
+    LinkDesc desc;
+    Vec3 point1, point2;   // anchors in the bodies' space
+    Vec3 axis1, axis2;     // Hinge/Slider axis; Fixed: x axis
+    Vec3 normal1, normal2; // Hinge/Slider normal; Fixed: y axis
+    f32 length = 0.0f;     // Spring rest length / Rope max length, resolved at creation
+    u32 broken = 0;
+};
+
+struct LinkRecord {
+    LinkState state;
+    JPH::Ref<JPH::TwoBodyConstraint> constraint;
+};
+
+// Entries of the constraint order list: Jolt's constraint array holds joints and links mixed, in this order
+constexpr u32 kLinkBit = 0x80000000u;
+
 // BodyDesc::group: bodies sharing a nonzero group never collide (no sub-group pairs: a ragdoll ignores itself entirely)
 class SameGroupFilter final : public JPH::GroupFilter {
 public:
@@ -246,8 +271,11 @@ struct PhysicsSnapshot::Impl {
     std::vector<u8> jolt;
     std::vector<CharacterSave> characters;
     u32 nextCharacter = 0;
-    std::vector<JointState> joints; // in Jolt's constraint order
+    std::vector<JointState> joints;
     u32 nextJoint = 0;
+    std::vector<LinkState> links;
+    u32 nextLink = 0;
+    std::vector<u32> order; // Jolt's constraint array: joint id, or link id | kLinkBit
 };
 
 PhysicsSnapshot::PhysicsSnapshot() = default;
@@ -309,6 +337,9 @@ void PhysicsSnapshot::write(std::vector<u8>& out) const {
     }
     writeValue(stream, m->nextJoint);
     writeVector(stream, m->joints);
+    writeValue(stream, m->nextLink);
+    writeVector(stream, m->links);
+    writeVector(stream, m->order);
 }
 
 bool PhysicsSnapshot::read(const u8* data, size_t size) {
@@ -355,6 +386,8 @@ bool PhysicsSnapshot::read(const u8* data, size_t size) {
     }
     stream.ReadBytes(&loaded.nextJoint, sizeof(loaded.nextJoint));
     if (stream.IsFailed() || !readVector(stream, loaded.joints, kLimit)) return false;
+    stream.ReadBytes(&loaded.nextLink, sizeof(loaded.nextLink));
+    if (stream.IsFailed() || !readVector(stream, loaded.links, kLimit) || !readVector(stream, loaded.order, kLimit)) return false;
     if (!m) m = new Impl();
     *m = std::move(loaded);
     return true;
@@ -410,8 +443,11 @@ struct PhysicsWorld::Impl {
     std::vector<CharacterRecord> characters; // creation order (declared after system: released first)
     u32 nextCharacter = 0;
     bool plane2d = false; // setPlane2D
-    std::vector<JointRecord> joints; // mirrors Jolt's constraint array order (swap-remove like Jolt)
+    std::vector<JointRecord> joints;
     u32 nextJoint = 0;
+    std::vector<LinkRecord> links; // creation order
+    u32 nextLink = 0;
+    std::vector<u32> order; // mirrors Jolt's constraint array order (swap-remove like Jolt): joint id, or link id | kLinkBit
     u32 threads = 0;
 
     JPH::Ref<JPH::CharacterVirtual> makeCharacter(const CharacterDesc& d) {
@@ -469,9 +505,105 @@ struct PhysicsWorld::Impl {
         return nullptr;
     }
 
+    JPH::Ref<JPH::TwoBodyConstraint> makeLink(const LinkState& l) {
+        const LinkDesc& d = l.desc;
+        JPH::Ref<JPH::TwoBodyConstraintSettings> settings;
+        switch (d.kind) {
+        case LinkKind::Hinge: {
+            JPH::HingeConstraintSettings* s = new JPH::HingeConstraintSettings();
+            s->mSpace = JPH::EConstraintSpace::LocalToBodyCOM;
+            s->mPoint1 = toJR(l.point1);
+            s->mHingeAxis1 = toJ(l.axis1);
+            s->mNormalAxis1 = toJ(l.normal1);
+            s->mPoint2 = toJR(l.point2);
+            s->mHingeAxis2 = toJ(l.axis2);
+            s->mNormalAxis2 = toJ(l.normal2);
+            const bool free = d.limitMin == 0.0f && d.limitMax == 0.0f;
+            s->mLimitsMin = free ? -JPH::JPH_PI : std::clamp(std::min(d.limitMin, 0.0f), -JPH::JPH_PI, 0.0f);
+            s->mLimitsMax = free ? JPH::JPH_PI : std::clamp(std::max(d.limitMax, 0.0f), 0.0f, JPH::JPH_PI);
+            settings = s;
+            break;
+        }
+        case LinkKind::Slider: {
+            JPH::SliderConstraintSettings* s = new JPH::SliderConstraintSettings();
+            s->mSpace = JPH::EConstraintSpace::LocalToBodyCOM;
+            s->mAutoDetectPoint = false;
+            s->mPoint1 = toJR(l.point1);
+            s->mSliderAxis1 = toJ(l.axis1);
+            s->mNormalAxis1 = toJ(l.normal1);
+            s->mPoint2 = toJR(l.point2);
+            s->mSliderAxis2 = toJ(l.axis2);
+            s->mNormalAxis2 = toJ(l.normal2);
+            if (d.limitMin != 0.0f || d.limitMax != 0.0f) {
+                s->mLimitsMin = std::min(d.limitMin, 0.0f);
+                s->mLimitsMax = std::max(d.limitMax, 0.0f);
+            }
+            settings = s;
+            break;
+        }
+        case LinkKind::Fixed: {
+            JPH::FixedConstraintSettings* s = new JPH::FixedConstraintSettings();
+            s->mSpace = JPH::EConstraintSpace::LocalToBodyCOM;
+            s->mAutoDetectPoint = false;
+            s->mPoint1 = toJR(l.point1);
+            s->mAxisX1 = toJ(l.axis1);
+            s->mAxisY1 = toJ(l.normal1);
+            s->mPoint2 = toJR(l.point2);
+            s->mAxisX2 = toJ(l.axis2);
+            s->mAxisY2 = toJ(l.normal2);
+            settings = s;
+            break;
+        }
+        case LinkKind::Spring:
+        case LinkKind::Rope: {
+            JPH::DistanceConstraintSettings* s = new JPH::DistanceConstraintSettings();
+            s->mSpace = JPH::EConstraintSpace::LocalToBodyCOM;
+            s->mPoint1 = toJR(l.point1);
+            s->mPoint2 = toJR(l.point2);
+            if (d.kind == LinkKind::Spring) {
+                s->mMinDistance = s->mMaxDistance = l.length;
+                s->mLimitsSpringSettings = JPH::SpringSettings(JPH::ESpringMode::FrequencyAndDamping, d.frequency, d.damping);
+            } else {
+                s->mMinDistance = 0.0f;
+                s->mMaxDistance = l.length;
+            }
+            settings = s;
+            break;
+        }
+        }
+        JPH::Constraint* c = bi().CreateConstraint(settings, JPH::BodyID(l.a), JPH::BodyID(l.b));
+        if (!c) return nullptr;
+        JPH::Ref<JPH::TwoBodyConstraint> link = static_cast<JPH::TwoBodyConstraint*>(c);
+        link->SetEnabled(l.broken == 0);
+        system.AddConstraint(link);
+        return link;
+    }
+
+    // Impulse (N·s) the link applied in the last solver step
+    static f32 linkImpulse(const LinkRecord& l) {
+        switch (l.state.desc.kind) {
+        case LinkKind::Hinge: return static_cast<const JPH::HingeConstraint*>(l.constraint.GetPtr())->GetTotalLambdaPosition().Length();
+        case LinkKind::Slider: return static_cast<const JPH::SliderConstraint*>(l.constraint.GetPtr())->GetTotalLambdaPosition().Length();
+        case LinkKind::Fixed: return static_cast<const JPH::FixedConstraint*>(l.constraint.GetPtr())->GetTotalLambdaPosition().Length();
+        case LinkKind::Spring:
+        case LinkKind::Rope: return std::abs(static_cast<const JPH::DistanceConstraint*>(l.constraint.GetPtr())->GetTotalLambdaPosition());
+        }
+        return 0.0f;
+    }
+
+    LinkRecord* link(LinkId id) {
+        for (LinkRecord& l : links)
+            if (l.state.id == id) return &l;
+        return nullptr;
+    }
+
+    // Removes every joint and link; they are rebuilt from a snapshot's order list
     void removeAllJoints() {
         for (JointRecord& j : joints) system.RemoveConstraint(j.constraint);
+        for (LinkRecord& l : links) system.RemoveConstraint(l.constraint);
         joints.clear();
+        links.clear();
+        order.clear();
     }
 
     JPH::BodyInterface& bi() { return system.GetBodyInterfaceNoLock(); }
@@ -702,6 +834,7 @@ JointId PhysicsWorld::createJoint(BodyId parent, BodyId child, const JointDesc& 
         return kInvalidJoint;
     }
     m->joints.push_back({j, constraint});
+    m->order.push_back(j.id);
     return j.id;
 }
 
@@ -710,6 +843,11 @@ void PhysicsWorld::destroyJoint(JointId joint) {
     if (it == m->joints.end()) return;
     m->system.RemoveConstraint(it->constraint);
     // Same swap-remove as Jolt's constraint array, so the order stays equal (snapshots restore by index)
+    auto at = std::find(m->order.begin(), m->order.end(), joint);
+    if (at != m->order.end()) {
+        *at = m->order.back();
+        m->order.pop_back();
+    }
     if (it != m->joints.end() - 1) *it = std::move(m->joints.back());
     m->joints.pop_back();
 }
@@ -731,6 +869,48 @@ void PhysicsWorld::setJointTorque(JointId joint, f32 maxTorque) {
 
 u32 PhysicsWorld::jointCount() const { return static_cast<u32>(m->joints.size()); }
 
+LinkId PhysicsWorld::createLink(BodyId a, BodyId b, const LinkDesc& desc) {
+    const JPH::RMat44 aInv = m->bi().GetCenterOfMassTransform(JPH::BodyID(a)).InversedRotationTranslation();
+    const JPH::RMat44 bInv = m->bi().GetCenterOfMassTransform(JPH::BodyID(b)).InversedRotationTranslation();
+    LinkState l;
+    l.id = m->nextLink++;
+    l.a = a;
+    l.b = b;
+    l.desc = desc;
+    const Vec3 pivot2 = (desc.kind == LinkKind::Spring || desc.kind == LinkKind::Rope) ? desc.pivot2 : desc.pivot;
+    l.point1 = fromJ(JPH::Vec3(aInv * toJR(desc.pivot)));
+    l.point2 = fromJ(JPH::Vec3(bInv * toJR(pivot2)));
+    JPH::Vec3 axis = toJ(desc.axis);
+    axis = axis.LengthSq() > 1.0e-8f ? axis.Normalized() : JPH::Vec3::sAxisY();
+    JPH::Vec3 normal = axis.GetNormalizedPerpendicular();
+    if (desc.kind == LinkKind::Fixed) { // frame = the world axes at creation
+        axis = JPH::Vec3::sAxisX();
+        normal = JPH::Vec3::sAxisY();
+    }
+    l.axis1 = fromJ(aInv.Multiply3x3(axis));
+    l.normal1 = fromJ(aInv.Multiply3x3(normal));
+    l.axis2 = fromJ(bInv.Multiply3x3(axis));
+    l.normal2 = fromJ(bInv.Multiply3x3(normal));
+    l.length = desc.length > 0.0f ? desc.length : (toJ(pivot2) - toJ(desc.pivot)).Length();
+    JPH::Ref<JPH::TwoBodyConstraint> constraint = m->makeLink(l);
+    if (!constraint) {
+        MEALKIT_ERROR("Physics: link between bodies %08x and %08x could not be created", a, b);
+        m->nextLink--;
+        return kInvalidLink;
+    }
+    m->links.push_back({l, constraint});
+    m->order.push_back(l.id | kLinkBit);
+    return l.id;
+}
+
+bool PhysicsWorld::linkBroken(LinkId link) const {
+    for (const LinkRecord& l : m->links)
+        if (l.state.id == link) return l.state.broken != 0;
+    return false;
+}
+
+u32 PhysicsWorld::linkCount() const { return static_cast<u32>(m->links.size()); }
+
 void PhysicsWorld::optimize() { m->system.OptimizeBroadPhase(); }
 
 void PhysicsWorld::step(f32 dt, int collisionSteps) {
@@ -738,6 +918,16 @@ void PhysicsWorld::step(f32 dt, int collisionSteps) {
     std::vector<ContactEvent>& events = m->contacts.events;
     events.clear();
     m->system.Update(dt, collisionSteps, &m->tempAllocator, m->jobs);
+    // Links over their break force turn off for good, in creation order (the impulse is deterministic like the rest of the solver)
+    const f32 subStep = dt / static_cast<f32>(std::max(collisionSteps, 1));
+    for (LinkRecord& l : m->links) {
+        if (l.state.broken || l.state.desc.breakForce <= 0.0f) continue;
+        if (Impl::linkImpulse(l) / subStep <= l.state.desc.breakForce) continue;
+        l.state.broken = 1;
+        l.constraint->SetEnabled(false);
+        m->bi().ActivateBody(JPH::BodyID(l.state.a));
+        m->bi().ActivateBody(JPH::BodyID(l.state.b));
+    }
     if (events.empty()) return;
     // Collection order differs per thread: sort by strength → body index → position to get the same result
     std::sort(events.begin(), events.end(), [](const ContactEvent& x, const ContactEvent& y) {
@@ -813,6 +1003,10 @@ void PhysicsWorld::hashState(Hasher& hasher) const {
         hasher.add(j.state.target);
         hasher.add(j.state.torque);
     }
+    for (const LinkRecord& l : m->links) {
+        hasher.add(l.state.id);
+        hasher.add(l.state.broken);
+    }
 }
 
 void PhysicsWorld::writeState(std::string& out) const {
@@ -840,6 +1034,10 @@ void PhysicsWorld::writeState(std::string& out) const {
         const Quat q = j.state.target;
         std::snprintf(line, sizeof(line), "joint %u %08x %08x target %.9g %.9g %.9g %.9g torque %.9g\n", j.state.id,
                       j.state.parent, j.state.child, q.x, q.y, q.z, q.w, j.state.torque);
+        out += line;
+    }
+    for (const LinkRecord& l : m->links) {
+        std::snprintf(line, sizeof(line), "link %u %08x %08x broken %u\n", l.state.id, l.state.a, l.state.b, l.state.broken);
         out += line;
     }
 }
@@ -870,6 +1068,10 @@ void PhysicsWorld::save(PhysicsSnapshot& out) const {
     out.m->joints.clear();
     for (const JointRecord& j : m->joints) out.m->joints.push_back(j.state);
     out.m->nextJoint = m->nextJoint;
+    out.m->links.clear();
+    for (const LinkRecord& l : m->links) out.m->links.push_back(l.state);
+    out.m->nextLink = m->nextLink;
+    out.m->order = m->order;
 }
 
 bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
@@ -887,8 +1089,23 @@ bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
         if (!contains(m->bodies, r.id)) addBody(m->bi(), r);
     m->bodies = s.records;
     m->ids = s.ids;
-    for (const JointState& j : s.joints) m->joints.push_back({j, m->makeJoint(j)});
+    // Constraints are added in the snapshot's order (Jolt's array order); the joint and link vectors keep their own order
+    m->joints.resize(s.joints.size());
+    m->links.resize(s.links.size());
+    for (size_t i = 0; i < s.joints.size(); ++i) m->joints[i].state = s.joints[i];
+    for (size_t i = 0; i < s.links.size(); ++i) m->links[i].state = s.links[i];
+    for (u32 entry : s.order) {
+        if (entry & kLinkBit) {
+            for (LinkRecord& l : m->links)
+                if (l.state.id == (entry & ~kLinkBit)) l.constraint = m->makeLink(l.state);
+        } else {
+            for (JointRecord& j : m->joints)
+                if (j.state.id == entry) j.constraint = m->makeJoint(j.state);
+        }
+    }
+    m->order = s.order;
     m->nextJoint = s.nextJoint;
+    m->nextLink = s.nextLink;
     std::vector<u8> bytes = s.jolt; // StateRecorder has a read position
     ByteStateRecorder recorder(bytes);
     if (!m->system.RestoreState(recorder)) {
@@ -918,6 +1135,7 @@ bool PhysicsWorld::restore(const PhysicsSnapshot& snapshot) {
 void PhysicsWorld::clearBodies() {
     m->removeAllJoints();
     m->nextJoint = 0;
+    m->nextLink = 0;
     m->characters.clear();
     m->nextCharacter = 0;
     for (const BodyRecord& r : m->bodies) m->remove(r.id);
